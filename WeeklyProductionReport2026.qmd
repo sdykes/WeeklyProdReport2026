@@ -1,0 +1,1486 @@
+```{r}
+#| label: initialisation
+#| message: false
+#| warning: false
+#| echo: false
+
+library(tidyverse)
+library(flextable)
+library(ragg)
+
+knitr::opts_chunk$set(echo = F, message = F, warning = F)
+
+source("../CommonFunctions/getSQL.r")
+
+SundayCloseDate <- "-04-26"
+SundayCloseMonth <- 4
+SundayCloseDay <- 26
+YearDay <- yday(as.Date(str_c("2026",SundayCloseDate)))
+
+currentWeek <- isoweek(as.Date(str_c("2026",SundayCloseDate)))
+
+
+```
+
+## Introduction
+
+Below is a weekly summary of production activity during Rockit™ apple 2026 season. The report summarises key production metrics and always has a close off date of midnight Sunday each week. Where appropriate comparisons are made to previous season(s).
+
+No attempt to interpret the data presented except to highlight differences between seasons.
+
+```{r}
+#| label: tbl-HarvestSummary
+#| tbl-cap: "Top line comparison of 2026 harvest compared to the same period in 2025"
+
+con <- DBI::dbConnect(odbc::odbc(),    
+                      Driver = "ODBC Driver 18 for SQL Server", 
+                      Server = "abcrepldb.database.windows.net",  
+                      Database = "ABCPackerRepl",   
+                      UID = "abcadmin",   
+                      PWD = "Trauts2018!",
+                      Port = 1433
+)
+
+BDV2024 <- DBI::dbGetQuery(con, "SELECT * FROM ma_Bin_DeliveryV")
+
+GBV2024 <- DBI::dbGetQuery(con, "SELECT * FROM ma_Grader_BatchV")
+
+BinsTipped <- DBI::dbGetQuery(con, 
+                              "SELECT 
+	bu.GraderBatchID
+	,CASE
+		WHEN gb.SeasonID = 2012 THEN 2025
+		ELSE 2026
+	END AS Season
+	,SUM(BinQty) AS BinsTipped
+	,MAX(PackDate) AS PackDate
+	,CASE 
+		WHEN gb.ClosedDateTime IS NULL THEN 'Open'
+		ELSE 'Closed'
+	END AS BatchStatus
+FROM ma_Bin_UsageT AS bu
+LEFT JOIN
+	ma_Grader_BatchT AS gb
+ON gb.GraderBatchID = bu.GraderBatchID
+WHERE gb.SeasonID IN (2012,2013)
+GROUP BY 
+	bu.GraderBatchID
+	,CASE
+		WHEN gb.SeasonID = 2012 THEN 2025
+		ELSE 2026
+	END
+  ,CASE 
+		WHEN gb.ClosedDateTime IS NULL THEN 'Open'
+		ELSE 'Closed'
+	END"
+)
+
+DefectAssessments <- DBI::dbGetQuery(con,
+                           "SELECT 
+	                              AssessmentID,
+	                              Season,
+	                              GraderBatchID,
+	                              TemplateName,
+	                              BinDeliveryID,
+	                              AssessmentDateTime,
+	                              SampleQty
+                            FROM qa_AssessmentT AS qa
+                            INNER JOIN
+	                              (
+	                              SELECT 
+		                                TemplateID,
+		                                TemplateName
+	                              FROM qa_TemplateT
+	                              WHERE TemplateID IN (13,14,28,33,43)
+	                              ) AS qt
+                            ON qt.TemplateID = qa.TemplateID
+                            INNER JOIN
+	                              (
+	                              SELECT
+		                                SeasonID,
+		                                SeasonDesc AS Season
+	                              FROM sw_SeasonT
+	                              ) AS st
+                            ON st.SeasonID = qa.SeasonID")
+
+Defects <- DBI::dbGetQuery(con,
+                           "SELECT 
+	                              AssessmentDefectID,
+	                              AssessmentID,
+	                              Defect,
+	                              DefectQty
+                            FROM qa_Assessment_DefectT AS qad
+                            INNER JOIN
+	                              (
+	                              SELECT
+		                                DefectID,
+		                                Defect
+	                              FROM qa_DefectT
+	                              ) AS dt
+                            ON dt.DefectID = qad.DefectID")
+
+BinsPerShift <- DBI::dbGetQuery(con, 
+                                "SELECT 
+	se.SeasonDesc AS Season
+	,gb.GraderBatchID
+	,ShiftID
+	,bu.[Bins tipped]
+	,gb.PackDate
+FROM ma_Grader_BatchT as gb
+LEFT JOIN
+	(
+	SELECT
+		GraderBatchID
+		,SUM(BinQty) AS [Bins tipped]
+	FROM ma_Bin_UsageT
+	WHERE GraderBatchID IS NOT NULL
+	GROUP BY GraderBatchID
+	) AS bu
+ON bu.GraderBatchID = gb.GraderBatchID
+LEFT JOIN
+  sw_SeasonT AS se
+ON se.SeasonID = gb.SeasonID
+WHERE gb.SeasonID IN (2012,2013)
+AND ClosedDateTime IS NOT NULL
+AND PresizeInputFlag = 0
+AND PackingCompanyID = 1
+ORDER BY gb.GraderBatchID
+")
+
+Class15KGs <- DBI::dbReadTable(con, "shiny_class15_KGsV")
+
+ReworkKgs <- DBI::dbReadTable(con, "shiny_Rework_KGsV")
+
+DBI::dbDisconnect(con)
+
+con <- DBI::dbConnect(odbc::odbc(),    
+                      Driver = "ODBC Driver 18 for SQL Server", 
+                      Server = "abcrepldb.database.windows.net",  
+                      Database = "ABCPacker2023Repl",   
+                      UID = "abcadmin",   
+                      PWD = "Trauts2018!",
+                      Port = 1433
+)
+
+BDV2020 <- DBI::dbGetQuery(con, "SELECT * FROM ma_Bin_DeliveryV")
+
+DBI::dbDisconnect(con)
+
+BDVSub <- BDV2024 |>
+  mutate(month = month(HarvestDate),
+         day = day(HarvestDate)) |>
+  filter(Season %in% c("2025","2026"),
+         Presize == "Field bin",
+         Juice == "Product",
+         yday(HarvestDate) <= YearDay) 
+#  select(-c(Presize, Juice))
+
+# Summaries for the bullet points
+
+BinsReceived2026 <- BDVSub |> 
+  filter(Season == 2026) |> 
+  summarise(`Bins received` = sum(`Bins received`, na.rm=T)) 
+
+MinHD = BDVSub |>
+  filter(Season ==2026) |>
+  summarise(minHD = min(HarvestDate))
+
+HarvestDays <- as.integer(as.Date(str_c("2026",SundayCloseDate), "%Y-%m-%d")-MinHD[[1,1]])
+
+BDVSubST <- BDVSub |>
+  filter(Season == 2026) |>
+  mutate(`Storage type` = if_else(`Storage type` == "Smartfreshed", "RA", "CA")) |>
+  group_by(`Storage type`) |>
+  summarise(`Bins received` = sum(`Bins received`, na.rm=T)) |>
+  filter(`Storage type` == "RA") 
+
+MaxHD <- BDVSub |>
+  summarise(MaxHD = max(HarvestDate))
+
+# Data for the table
+
+minHD <- BDVSub |>
+  group_by(Season) |>
+  summarise(minHD = min(HarvestDate),
+            .groups = "drop") |>
+  pivot_wider(names_from = Season,
+              values_from = minHD) |>
+  mutate(" " = "Harvest start date",
+         across(.cols = c(`2025`,`2026`), ~format(.,"%d %b %Y"))) |>
+  relocate(` `, .before = `2025`)
+
+BinHarvested <- BDVSub |>
+  group_by(Season) |>
+  summarise(`Bins received` = sum(`Bins received`, na.rm=T),
+            .groups = "drop") |>
+  pivot_wider(names_from = Season,
+              values_from = `Bins received`) |>
+  mutate(Change = (`2026`-`2025`)/`2025`,
+         #across(.cols = c(`2025`,`2026`), ~scales::comma(.,1)),
+         #Change = scales::percent(Change, 0.1),
+         " " = "Bins received") |>
+  relocate(` `, .before = `2025`) 
+
+RABins <- BDVSub |>
+  group_by(Season, `Storage type`) |>
+  summarise(`Bins received` = sum(`Bins received`, na.rm=T),
+            .groups = "drop") |>
+  pivot_wider(id_cols = `Storage type`,
+              names_from = Season,
+              values_from = `Bins received`) |>
+  mutate(#across(.cols = c(`2025`,`2026`), ~scales::comma(.,1)),
+         `Storage type` = if_else(`Storage type` == "Smartfreshed", "RA", "CA"), 
+          across(.cols = c(`2025`,`2026`), ~replace_na(.,"0"))) |>
+  rename(` ` = `Storage type`) 
+
+SeasonSummary <- minHD |>
+  bind_rows(BinHarvested |> 
+              select(-Change) |>
+              mutate(across(.cols = c(`2025`,`2026`), ~scales::comma(.,1)))) |>
+  bind_rows(RABins |>
+              mutate(across(.cols = c(`2025`,`2026`), ~scales::comma(.,1))))  
+
+BinsProcessed <- GBV2024 |>
+  mutate(YearDays = yday(PackDate)) |>
+  filter(Presize == "Field bin",
+         BatchStatus == "Closed",
+         Season %in% c(2025,2026),
+         YearDays <= YearDay) |>
+  group_by(Season) |>
+  summarise(FieldBinsTipped = sum(FieldBinsTipped, na.rm=T),
+            InputKgs = sum(InputKgs, na.rm=T),
+            RejectKgs = sum(RejectKgs, na.rm=T)) |>
+  mutate(Packout = 1-RejectKgs/InputKgs)
+
+BinsPacked <- BinsProcessed |>
+  select(c(Season, FieldBinsTipped)) |>
+  pivot_wider(names_from = Season,
+              values_from = FieldBinsTipped,
+              values_fill = 0)
+
+Packout <- BinsProcessed |>
+  select(c(Season, Packout)) |>
+  pivot_wider(names_from = Season,
+              values_from = Packout,
+              values_fill = 0)
+
+SeasonSummary |>
+  flextable::flextable() |>
+  flextable::align(j=c(2,3), align = "right", part = "all") |>
+  flextable::bold(bold = TRUE, part="header") |>
+  flextable::autofit() |>
+  flextable::fit_to_width(max_width=6)
+  
+
+```
+
+## Harvest
+
+-   Harvest commenced on `r minHD[[1,3]]`.
+-   `r scales::comma(BinsReceived2026[[1,1]],1.0)` have been bins received, season to date.
+-   The final day of harvest was `r format(MaxHD$MaxHD[[1]], format = "%d %b %Y")`
+
+### Harvest rate compared to previous three seasons
+
+```{r}
+#| label: fig-HarvestRate
+#| fig-cap: "Rate of harvest, by harvest date, in cumulative bins per for the last four years (note missing years indicate that harvest had not commenced)."
+#| fig-align: center
+#| out-width: 96%
+#| fig-asp: 0.7
+
+
+
+BDV2020 |>
+  bind_rows(BDV2024) |>
+  mutate(YearDays = yday(HarvestDate)) |>
+  filter(Presize == "Field bin",
+         Juice == "Product", 
+         Season %in% c("2023","2024","2025","2026"),
+         YearDays <= YearDay) |>
+  group_by(Season, HarvestDate) |>
+  summarise(`Bins received` = sum(`Bins received`, na.rm=T)) |>
+  mutate(cumBins = cumsum(`Bins received`),
+         PlotDate = as.Date(str_c("2024",str_sub(as.character(HarvestDate),5,-1)))) |>
+  filter(PlotDate <= as.Date(str_c("2024",{{SundayCloseDate}}))) |>
+  ggplot(aes(x = PlotDate, y=cumBins, groups = Season)) +
+  geom_line(aes(colour = Season), linewidth = 1) +
+  scale_fill_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  scale_colour_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  scale_y_continuous("cumulative bins harvested", labels = scales::label_comma(1.0)) +
+  scale_x_date(breaks = scales::breaks_width("2 weeks"),labels = scales::label_date(format = "%b-%d")) +
+  labs(x="Harvest date") +
+  ggthemes::theme_economist() + 
+  theme(text = element_text(family = "Geograph"),
+        axis.title.x = element_text(margin = margin(t = 7), size = 10,colour = "#48762e",face = "bold"),
+        axis.title.y = element_text(margin = margin(r = 7), size = 10,colour = "#48762e",face = "bold"),
+        axis.text.y = element_text(size = 10, hjust=1,colour = "#48762e",face = "bold"),
+        axis.text.x = element_text(size = 7,colour = "#48762e",face = "bold"),
+        plot.background = element_rect(fill = "#F7F1DF", colour = "#F7F1DF"),
+        plot.title = element_text(margin = margin(b = 10)),
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 10))
+
+#ggsave(
+#  "harvestrate.png",
+#  device = ragg::agg_png,
+#  width = 10,
+#  height = 7,
+#  units = "in",
+#  dpi = 300
+#)
+
+```
+
+Relative to 2025, the 2026 harvest was slow to start and the daily rate of bins harvested from ISO-week 9 (23 Feb). As of the 26 Apr 2026 the cumulative bins harvested is now `r scales::percent(BinHarvested$Change[[1]],0.1)` compared to the same date in 2025.
+
+## Maturity distribution
+
+```{r}
+#| label: fig-MaturityDist
+#| fig-cap: "Distribution of harvest submission maturity (by RSP) for 2026 (STD) compared to the same period in 2025"
+#| fig-align: center
+#| out-width: 96%
+#| fig-asp: 0.7
+
+BDV2024 |>
+  mutate(YearDays = yday(HarvestDate)) |>
+  filter(Presize == "Field bin",
+         Juice == "Product",
+         Season %in% c("2025","2026"),
+         !Maturity %in% c("X (Pressure)","N (SPI)","N (Brix)"),
+         YearDays <= YearDay) |>
+  group_by(Season, Maturity) |>
+  summarise(MatCount = n()) |>
+  mutate(PropRSP = MatCount/sum(MatCount),
+         PercRSP = scales::percent(PropRSP,0.1)) |>
+  ggplot(aes(Maturity,MatCount)) +
+  geom_col(colour = "#73a83b",fill="#73a83b", alpha = 0.5) +
+  facet_wrap(~Season, scales = "free_x") +
+  geom_text(aes(label = PercRSP, y = MatCount+80), position = position_dodge(0.9), size=3) +
+  labs(x = "Maturity (RSP)",
+       y = "Consignment count") +
+  scale_y_continuous(labels = scales::label_comma(1.0)) +
+  scale_fill_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  scale_colour_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  ggthemes::theme_economist() + 
+  theme(text = element_text(family = "Geograph"),
+        axis.title.x = element_text(margin = margin(t = 7), size = 12, colour = "#48762e",face = "bold"),
+        axis.title.y = element_text(margin = margin(r = 7), size = 12, colour = "#48762e",face = "bold"),
+        axis.text.y = element_text(size = 12, hjust=1, colour = "#48762e",face = "bold"),
+        axis.text.x = element_text(size = 12, colour = "#48762e",face = "bold"),
+        plot.background = element_rect(fill = "#F7F1DF", colour = "#F7F1DF"),
+        plot.title = element_text(margin = margin(b = 10)),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 12))
+  
+# ggsave(
+#  "maturityHist.png",
+#  device = ragg::agg_png,
+#  width = 10,
+#  height = 7,
+#  units = "in",
+#  dpi = 300
+#)
+
+
+```
+
+The maturity distribution for 2026 has a higher proportion of **A** and **B** profile fruit compared to 2025 (82.7% in 2026 compared to 67.6% in 2025), in terms of the mix of **A** and **B** RSP fruit (20% **A** fruit in 2026 compared to 16% in 2025). The presence of 17.3% **C** profile fruit in 2026 is also notable; however, when comparing to 2025 the 2026 proportion looks favourable given that RSP **B2** (31% in 2025) is technically a **C** (based on 2026 criteria).
+
+## Storage
+
+As of `r format(as.Date(str_c("2026",SundayCloseDate)),"%d %b %Y")` the storage sites that had received bins are listed in @tbl-StorageLocation. A breakdown of bins by CA and RA environment is also given in the table.
+
+```{r}
+#| label: tbl-StorageLocation
+#| tbl-cap: "Bins by storage location and storage type, season to date (26 Apr 2026)"
+
+BinReceivedTotal <- BDV2024 |>
+  mutate(YearDays = yday(HarvestDate)) |>
+  filter(Season == "2026",
+         Presize == "Field bin",
+         Juice == "Product",
+         YearDays <= YearDay) |>
+  mutate(`Storage type` = if_else(`Storage type` == "CA Smartfresh","CA","RA")) |>
+  group_by(`Storage type`) |>
+  summarise(`Bins received` = sum(`Bins received`, na.rm=T)) |>
+  pivot_wider(names_from = `Storage type`,
+              values_from = `Bins received`,
+              values_fill = 0) |>
+  mutate(Total = CA+RA,
+         `Storage site` = "Total") |>
+  relocate(`Storage site`, .before = CA)
+
+BDV2024 |>
+  mutate(YearDays = yday(HarvestDate)) |>
+  filter(Season == "2026",
+         Presize == "Field bin",
+         Juice == "Product",
+         YearDays <= YearDay) |>
+  mutate(`Storage type` = if_else(`Storage type` == "CA Smartfresh","CA","RA")) |>
+  group_by(`Storage site`,`Storage type`) |>
+  summarise(`Bins received` = sum(`Bins received`, na.rm=T),
+            .groups = "drop") |>
+  pivot_wider(id_cols = `Storage site`,
+              names_from = `Storage type`,
+              values_from = `Bins received`,
+              values_fill = 0) |>
+  mutate(Total = CA+RA) |>
+  bind_rows(BinReceivedTotal) |>
+  flextable() |>
+  flextable::bold(bold = TRUE, part="header") |>
+  flextable::bold(i=6, bold = TRUE, part = "body") |>
+  flextable::hline(i=5) |>
+  flextable::autofit() |>
+  flextable::fit_to_width(max_width=6)
+
+
+```
+
+Currently `r scales::percent(BinReceivedTotal$CA[[1]]/BinReceivedTotal$Total[[1]],0.1)` of fruit received has been stored in CA environments.
+
+## Packout
+
+```{r}
+#| label: fig-PackoutPlot
+#| fig-cap: "Packout as a function of storage days for 2026 season to date (26 Apr 2026) compared to the same period in 2025.  The data include all pack site except Freshco Nelson which is given in the figure below"
+
+PackOutPlotSumRaw <- GBV2024 |>
+  mutate(YearDays = yday(PackDate)) |>
+  filter(Presize == "Field bin",
+         BatchStatus == "Closed",
+         Season %in% c("2025","2026")) |>
+  mutate(StorageDays = as.integer(PackDate - HarvestDate),
+         Packout = 1-RejectKgs/InputKgs) 
+
+PackOutPlotSum <- PackOutPlotSumRaw |>
+  filter(YearDays <= YearDay) 
+
+#
+# Doing a linear regression on the data
+#
+#Linear_Model <- lm(Packout ~ StorageDays*Season, data = PackOutPlotSum |> filter(`Packing site` != "Freshco Nelson"))
+#Slope2026 <- scales::percent(summary(Linear_Model)$coeff[[2]]+summary(Linear_Model)$coeff[[4]],0.01)
+#Slope2025 <- scales::percent(summary(Linear_Model)$coeff[[2]],0.01)
+#Baseline2025 <- scales::percent(summary(Linear_Model)$coeff[[1]]+summary(Linear_Model)$coeff[[3]],0.01)
+#Baseline2026 <- scales::percent(summary(Linear_Model)$coeff[[1]],0.01)
+
+# Non linear analysis
+
+PackOutPlotSum2026 <- PackOutPlotSumRaw |>
+  filter(Season == "2026")
+
+StorageDaysRA <- tibble(StorageDays = seq(0,max(PackOutPlotSum$StorageDays),1))
+
+NLmodel2026RA <- nls(Packout ~ alpha *exp(beta * StorageDays) + theta, 
+                      data=PackOutPlotSum2026, 
+                      control = nls.control(maxiter = 1000), 
+                      start=list(alpha=0.1, beta=-.1, theta=0.60))
+
+# summary(NLmodel2026RA) 
+
+prediction <- tibble(.pred = predict(NLmodel2026RA, newdata = StorageDaysRA))
+
+RAPred2026 <- StorageDaysRA |>
+  bind_cols(prediction) |>
+  mutate(Season = "2026")
+
+PackOutPlotSum2025 <- PackOutPlotSumRaw |>
+  filter(Season == "2025",
+         `Packing site` == "Te Ipu Packhouse (RO)",
+         StorageDays <= 200)
+
+NLmodel2025RA <- nls(Packout ~ alpha *exp(beta * StorageDays) + theta, 
+                      data=PackOutPlotSum2025, 
+                      control = nls.control(maxiter = 1000), 
+                      start=list(alpha=0.2, beta=-.02, theta=0.65))
+
+# summary(NLmodel2025RA) 
+
+prediction2025 <- tibble(.pred = predict(NLmodel2025RA, newdata = StorageDaysRA))
+
+RAPred2025 <- StorageDaysRA |>
+  bind_cols(prediction2025) |>
+  mutate(Season = "2025")
+
+AggPackout <- PackOutPlotSum |>
+  filter(`Packing site` != "Freshco Nelson") |>
+  group_by(Season) |>
+  summarise(InputKgs = sum(InputKgs),
+            RejectKgs = sum(RejectKgs)) |>
+  mutate(Packout = 1-RejectKgs/InputKgs)
+
+MinPD <- PackOutPlotSum |>
+  group_by(Season) |>
+  summarise(minPD = min(PackDate))
+
+PackOutPlotSum |>
+  filter(`Packing site` != "Freshco Nelson") |>
+  ggplot(aes(StorageDays,Packout)) +
+  geom_point(aes(colour = `Packing site`, shape = `Packing site`), size = 3, alpha = 0.7) +
+  facet_wrap(~Season) +
+  #geom_smooth(method = "lm", colour = "black") +
+  geom_line(data = RAPred2025, aes(x=StorageDays, y=.pred), linewidth = 1) +
+  geom_line(data = RAPred2026, aes(x=StorageDays, y=.pred), linewidth = 1) +
+  labs(x = "Storage days") +
+  scale_y_continuous("Packout / %", labels = scales::label_percent(1.0)) +
+  scale_fill_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  scale_colour_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  ggthemes::theme_economist() + 
+  theme(legend.position = "top",
+        text = element_text(family = "Geograph"),
+        axis.title.x = element_text(margin = margin(t = 10), size = 8),
+        axis.title.y = element_text(margin = margin(r = 10), size = 8),
+        axis.text.y = element_text(size = 8, hjust=1),
+        axis.text.x = element_text(size = 8),
+        plot.background = element_rect(fill = "#F7F1DF", colour = "#F7F1DF"),
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 6),
+        strip.text = element_text(margin = margin(b=5,t=5), size = 10),
+        strip.background = element_rect(fill = "#fbe0af"))
+
+
+```
+
+```{r}
+#| label: fig-FNPackout
+#| fig-cap: "Packout as a function of storage days for Rockit apples packed at FreshCo Nelson up to the 26 Apr 2026"
+
+AggPackoutFN <- PackOutPlotSum |>
+  filter(`Packing site` == "Freshco Nelson") |>
+  group_by(Season) |>
+  summarise(InputKgs = sum(InputKgs),
+            RejectKgs = sum(RejectKgs)) |>
+  mutate(Packout = 1-RejectKgs/InputKgs)
+
+PackOutPlotSum |>
+  filter(`Packing site` == "Freshco Nelson") |>
+  ggplot(aes(StorageDays,Packout)) +
+  geom_point(aes(colour = `Packing site`), size = 3, alpha = 0.7) +
+  geom_smooth(method = "lm", colour = "black") +
+  labs(x = "Storage days") +
+  scale_y_continuous("Packout / %", labels = scales::label_percent(1.0)) +
+  scale_fill_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  scale_colour_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  ggthemes::theme_economist() + 
+  theme(legend.position = "top",
+        text = element_text(family = "Geograph"),
+        axis.title.x = element_text(margin = margin(t = 10), size = 8),
+        axis.title.y = element_text(margin = margin(r = 10), size = 8),
+        axis.text.y = element_text(size = 8, hjust=1),
+        axis.text.x = element_text(size = 8),
+        plot.background = element_rect(fill = "#F7F1DF", colour = "#F7F1DF"),
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 6),
+        strip.text = element_text(margin = margin(b=5,t=5), size = 10),
+        strip.background = element_rect(fill = "#fbe0af"))
+
+
+```
+
+From @fig-PackoutPlot, contrasting 2026 to the same period in 2025 the most notable feature is the large spread (variability) and the steep decline of the 2026 packouts. The likely causes for the variability is poor underlying fruit quality with an overall increase in the incidence of the predominant defects (cosmetic blemish, punctures and bruising); combined with potential sub-optimal picking performance (i.e. high incidence of stem tears). The colour and shape of the points on @fig-PackoutPlot denote the packing site where that batch was processed.
+
+Total aggregate packout for all batches excluding the ones packed at FreshCo Nelson, season to date, in 2026 is `r scales::percent(AggPackout$Packout[[2]],0.1)` compared to `r scales::percent(AggPackout$Packout[[1]],0.1)` for the same period in 2025. For FreshCo Nelson the aggregate packout is currently recorded at `r scales::percent(AggPackoutFN$Packout[[1]],0.1)`.
+
+An attempt at modeling the trend for this years packout is shown on @fig-PackoutPlot. The behaviour of packout with storage days is non-linear and can be defined by the following relationship for batch $i$:
+
+$$E\left[ \text{Packout}_{i}|\text{SD}_{i} \right] =\Theta + \alpha e^{-\beta SD_{i}}$$
+
+where the three parameters can be defined as: Starting value (Θ + α), rate of decline (β) and steady state packout (Θ). In terms of the baseline packout (i.e. the packout when storage days = 0) in 2026 gives `r scales::percent(summary(NLmodel2026RA)$coef[[1]]+summary(NLmodel2026RA)$coef[[3]],0.1)` compared to `r scales::percent(summary(NLmodel2025RA)$coef[[1]]+summary(NLmodel2025RA)$coef[[3]],0.1)`. The next step is to model the packing plan for the season and estimate the seasonal packout.
+
+```{r}
+#| label: tbl-modelParams
+#| tbl-cap: "Model parameters for packout vs storage days curves"
+
+tibble(Season = c(2025,2026),
+       `Baseline packout` = c(summary(NLmodel2025RA)$coef[[1]]+summary(NLmodel2025RA)$coef[[3]],
+                                    summary(NLmodel2026RA)$coef[[1]]+summary(NLmodel2026RA)$coef[[3]]),
+       `Rate of decline` = c(summary(NLmodel2025RA)$coef[[2]],summary(NLmodel2026RA)$coef[[2]]),
+       `Steady state packout` = c(summary(NLmodel2025RA)$coef[[3]],summary(NLmodel2026RA)$coef[[3]])) |>
+  mutate(across(.cols = -Season, ~scales::percent(., 0.01))) |>
+  flextable() |>
+  colformat_double(j="Season", big.mark="",digits = 0) |>
+  add_header_row(values = c("","(ϴ+α) %","(β) day⁻¹","(ϴ) %"),
+                 colwidths = c(1,1,1,1),
+                 top = FALSE) |>
+  hline(i=1, border = fp_border_default(width = 0), part = "header") |>
+  bold(bold = TRUE, part = "header") |>
+  align(align = "center", part = "header") |>
+  align(j=c(2:4), align = "right", part="body") |>
+  footnote(i=1,j=3,value = as_paragraph(
+    c("This represents the % or relative change in packout per day rather than the absolute change")), 
+    part = "header") |>
+  fontsize(size = 9, part = "footer") |>
+  flextable::autofit() |>
+  flextable::fit_to_width(max_width=6)
+  
+```
+
+The packout performance by individual pack site is given in @tbl-POByPackSite. These results are from closed batches and are unnormalised (relative to Te Ipu packouts).
+
+The above analysis only covers closed batches. At the time of the publishing of this report 63 of the 390 batches run in 2026 were still open and not part of the above analysis.
+
+## Packout by Packing site
+
+```{r}
+#| label: tbl-POByPackSite
+#| tbl-cap: "Packout, Season-to-date (to the 26 Apr 2026), by packing site.  Note all batches included in this table are closed."
+
+PackOutPlotSumTot <- PackOutPlotSum |>
+  group_by(Season) |>
+  summarise(FieldBinsTipped = sum(FieldBinsTipped),
+            InputKgs = sum(InputKgs, na.rm=T),
+            RejectKgs = sum(RejectKgs, na.rm=T)) |>
+  mutate(Packout = 1-RejectKgs/InputKgs) |>
+  select(c(Season, FieldBinsTipped, Packout)) |>
+  pivot_wider(names_from = Season,
+              values_from = c(FieldBinsTipped, Packout),
+              values_fill = 0) |>
+  mutate(`Packing site` = "Total") |>
+  relocate(`Packing site`, .before = FieldBinsTipped_2025) |>
+  relocate(Packout_2025, .after = FieldBinsTipped_2025)
+
+PackOutPlotSum |>
+  group_by(Season, `Packing site`) |>
+  summarise(FieldBinsTipped = sum(FieldBinsTipped),
+            InputKgs = sum(InputKgs, na.rm=T),
+            RejectKgs = sum(RejectKgs, na.rm=T)) |>
+  mutate(Packout = 1-RejectKgs/InputKgs) |>
+  select(c(Season, `Packing site`, FieldBinsTipped, Packout)) |>
+  pivot_wider(id_cols = `Packing site`,
+              names_from = Season,
+              values_from = c(FieldBinsTipped, Packout),
+              values_fill = 0) |>
+  relocate(Packout_2025, .after = FieldBinsTipped_2025) |>
+  bind_rows(PackOutPlotSumTot) |>
+  mutate(across(starts_with("FieldBinsTipped"),~scales::comma(.,1.0)),
+         across(starts_with("Packout"),~scales::percent(.,0.1))) |>
+  flextable() |>
+  set_header_labels(FieldBinsTipped_2025 = "Bins tipped",
+                    Packout_2025 = "Packout",
+                    FieldBinsTipped_2026 = "Bins tipped",
+                    Packout_2026 = "Packout") |>
+  add_header_row(values = c(" ","2025","2026"), colwidths = c(1,2,2)) |>
+  align(j=c(2:5), align = "center", part = "header") |>
+  align(j=c(2:5), align = "right", part = "body") |>
+  bold(bold = T, part = "header") |>
+  bold(i=5, bold = T, part="body") |>
+  hline(i=4, part="body") |>
+  flextable::autofit() |>
+  flextable::fit_to_width(max_width=6)
+
+```
+
+## Bins per shift (Te Ipu only)
+
+Packhouse productivity at Te Ipu is an important measure of seasonal performance. Te Ipu is the only packhouse that has shift information so the data in @tbl-BPS only applies to the Te Ipu site. The data is given on a weekly and season-to-date basis.
+
+Overall season-to-date bins per shift in week `r currentWeek` is significantly higher than in the same week `r currentWeek` in 2025 (almost 7% higher). On a week-by-week basis Week `r currentWeek` saw an increase in bins per shift compared to week `r currentWeek-1`, and and a notable increase compared to week `r currentWeek` in 2025.
+
+```{r}
+#| label: tbl-BPS
+#| tbl-cap: "Bins per shift for Te Ipu Packhouse.  Data is presented on a weekly and season-to-date basis"
+
+con <- DBI::dbConnect(odbc::odbc(),    
+                      Driver = "ODBC Driver 18 for SQL Server", 
+                      Server = "abcrepldb.database.windows.net",  
+                      Database = "ABCPackerRepl",   
+                      UID = "abcadmin",   
+                      PWD = "Trauts2018!",
+                      Port = 1433
+)
+
+BinT <- DBI::dbGetQuery(con, "SELECT * FROM ma_BinT")
+
+GBV <- DBI::dbGetQuery(con, "SELECT * FROM ma_Grader_BatchV")
+
+DBI::dbDisconnect(con)
+
+ShiftAssign <- BinT |>
+  mutate(TipDay = yday(TippedDatetime)) |>
+  filter(TippedDatetime > as.POSIXct("2025-01-01 00:00:00.000"),
+         TipDay <= YearDay,
+         !is.na(GraderBatchID)) |>
+  select(-c(TimeStamp)) |>
+  mutate(TippedDate = as.Date(TippedDatetime),
+         TipWeek = isoweek(TippedDatetime),
+         AdjTippedDateTime = TippedDatetime - hours(5) - minutes(30),
+         TippedTime = hour(AdjTippedDateTime)+minute(AdjTippedDateTime)/60+second(AdjTippedDateTime)/3600,
+         ShiftID = case_when(TippedTime >= 0.0 & TippedTime < 10.5 ~ "D",
+                             TippedTime >= 10.5 & TippedTime <= 24.0 ~ "N",
+                             TRUE ~ "Other"),
+         UniqueShiftID = case_when(day(AdjTippedDateTime) <= 9 ~ str_c("0",day(AdjTippedDateTime),"0",month(AdjTippedDateTime),ShiftID),
+                                   TRUE ~ str_c(day(AdjTippedDateTime),"0",month(AdjTippedDateTime),ShiftID)))
+
+TeIpuGB <- GBV |>
+  filter(Presize == "Field bin",
+         Season %in% c(2025,2026),
+         `Packing site` == "Te Ipu Packhouse (RO)") |>
+  select(c(GraderBatchID,Season))
+
+
+
+BPSSummary <- ShiftAssign |>
+  inner_join(TeIpuGB, by = "GraderBatchID") |>
+  group_by(Season,TipWeek,UniqueShiftID) |>
+  summarise(BinCount = n(),
+            .groups = "drop") |>
+  group_by(Season,TipWeek) |>
+  summarise(ShiftCount = n(),
+            Bins = sum(BinCount),
+            .groups = "drop") |>
+  mutate(BPS = Bins/ShiftCount)
+
+wkc <- currentWeek
+wkcM1 <- currentWeek-1
+
+WeeklySummary <- BPSSummary |>
+  filter(TipWeek %in% c(wkcM1,wkc)) |>
+  select(-c(ShiftCount,Bins)) |>
+  pivot_wider(names_from = c(Season, TipWeek),
+              values_from = BPS,
+              values_fill = 0) |>
+  mutate(WeeklyChange = (!!sym(str_c("2026_",wkc))-!!sym(str_c("2026_",wkcM1)))/!!sym(str_c("2026_",wkcM1)),
+         YearlyChange = (!!sym(str_c("2026_",wkc))-!!sym(str_c("2025_",wkc)))/!!sym(str_c("2026_",wkc))) |>
+  select(c(!!sym(str_c("2026_",wkc)),!!sym(str_c("2026_",wkcM1)),WeeklyChange,!!sym(str_c("2025_",wkc)),YearlyChange))
+
+
+YTDSummary <- BPSSummary |>
+  group_by(Season) |>
+  mutate(cumShifts = cumsum(ShiftCount),
+         CumBins = cumsum(Bins),
+         cumBPS = CumBins/cumShifts) |>
+  filter(TipWeek %in% c(wkcM1,wkc)) |>
+  select(c(Season, TipWeek, cumBPS)) |>
+  pivot_wider(names_from = c(Season, TipWeek),
+              values_from = cumBPS,
+              values_fill = 0) |>
+  mutate(WeeklyChange = (!!sym(str_c("2026_",wkc))-!!sym(str_c("2026_",wkcM1)))/!!sym(str_c("2026_",wkcM1)),
+         YearlyChange = (!!sym(str_c("2026_",wkc))-!!sym(str_c("2025_",wkc)))/!!sym(str_c("2026_",wkc))) |>
+  select(c(!!sym(str_c("2026_",wkc)),!!sym(str_c("2026_",wkcM1)),WeeklyChange,!!sym(str_c("2025_",wkc)),YearlyChange))
+
+WeeklySummary |>
+  mutate(Measure = "Weekly") |>
+  bind_rows(YTDSummary |>
+              mutate(Measure = "Season-to-date")) |>
+  relocate(Measure, .before = colnames(WeeklySummary)[[1]]) |>
+  mutate(across(.cols = c(!!sym(str_c("2026_",wkc)),!!sym(str_c("2026_",wkcM1)),!!sym(str_c("2025_",wkc))), ~scales::comma(.,0.1)),
+         across(.cols = c(WeeklyChange,YearlyChange),~scales::percent(.,0.01))) |>
+  flextable() |>
+  add_header_row(values = c(" ","2026","2025"), colwidths = c(1,3,2)) |>
+  set_header_labels(values = c("Measure",str_c("Week ",wkc),str_c("Week ",wkc-1),"Weekly change",
+                               str_c("Week ",wkc),"Seasonal change")) |>
+  align(j = c(2:6), align = "center", part = "header") |>
+  align(j = c(2:6), align = "right", part = "body") |>
+  flextable::autofit() |>
+  flextable::fit_to_width(max_width=6)
+
+
+```
+
+## Defect analysis
+
+The top 15 defects for fruit packed as of `r format(as.Date(str_c("2026",SundayCloseDate)),"%d %b %Y")`. The histogram presented in @fig-DefectProfile also includes the the same defects for the same pack dates in 2025.
+
+```{r}
+#| label: fig-DefectProfile
+#| fig-cap: "Defect profile (top 15 defects) from closed batches from packing to 26 Apr 2026. The 2025 profile for the same defects and pack dates is plotted for comparison. The left hand plot shows all batches excluding batches with a packout lower than 65%.  The right hand plot shows all batches."
+#| fig-align: center
+#| out-width: 100%
+#| fig-asp: 1.0
+
+SampleQty <- DefectAssessments |>
+  mutate(AssessmentDate = as.Date(AssessmentDateTime)) |>
+  filter((Season == 2025 & AssessmentDate >= as.Date(as.Date("2025-01-01")) & 
+                              AssessmentDate <= as.Date(as.Date(str_c("2025",SundayCloseDate)))) |
+           (Season == 2026 & AssessmentDate >= as.Date(as.Date("2026-01-01")) & 
+                              AssessmentDate <= as.Date(as.Date(str_c("2026",SundayCloseDate))))) |>
+  group_by(GraderBatchID) |>
+  summarise(SampleQty = sum(SampleQty, na.rm=T))
+
+POPop <- GBV2024 |>
+  filter((Season == 2025 & (PackDate >= as.Date("2025-01-01") & 
+                              PackDate <= as.Date(str_c("2025",SundayCloseDate)))) |
+           (Season == 2026 & (PackDate >= as.Date("2026-01-01") & 
+                               PackDate < as.Date(str_c("2026",SundayCloseDate))))) |>
+  group_by(Season) |>
+  summarise(InputKgs = sum(InputKgs, na.rm=T),
+            RejectKgs = sum(RejectKgs, na.rm=T)) |>
+  mutate(Packout = 1-RejectKgs/InputKgs)
+
+DefectSummaryTot <- Defects |>
+  inner_join(DefectAssessments |> select(c(AssessmentID, GraderBatchID)),
+             by = "AssessmentID") |>
+  group_by(GraderBatchID, Defect) |>
+  summarise(DefectQty = sum(DefectQty),
+            .groups = "drop") |>
+  inner_join(SampleQty, by = "GraderBatchID") |>
+  left_join(GBV2024 |> select(c(GraderBatchID, Season, PackDate, InputKgs, RejectKgs)),
+            by = "GraderBatchID") |>
+  mutate(Packout = 1-RejectKgs/InputKgs,
+         DefectProp = (DefectQty/SampleQty)*(RejectKgs/InputKgs),
+         DefetcPercent = scales::percent(DefectProp, 0.01),
+         Index = "Total") |>
+  filter(!is.na(DefectProp))
+
+DefectSummary <- Defects |>
+  inner_join(DefectAssessments |> select(c(AssessmentID, GraderBatchID)),
+             by = "AssessmentID") |>
+  group_by(GraderBatchID, Defect) |>
+  summarise(DefectQty = sum(DefectQty),
+            .groups = "drop") |>
+  inner_join(SampleQty, by = "GraderBatchID") |>
+  left_join(GBV2024 |> select(c(GraderBatchID, Season, PackDate, InputKgs, RejectKgs)),
+            by = "GraderBatchID") |>
+  mutate(Packout = 1-RejectKgs/InputKgs,
+         DefectProp = (DefectQty/SampleQty)*(RejectKgs/InputKgs),
+         DefetcPercent = scales::percent(DefectProp, 0.01),
+         Index = "Sub") |>
+  filter(!is.na(DefectProp))
+
+DefectSummary <- DefectSummaryTot |>
+  filter((Season == 2025 & (PackDate >= as.Date("2025-01-01") & PackDate <= as.Date(str_c("2025",SundayCloseDate)))) |
+           (Season == 2026 & (PackDate >= as.Date("2026-01-01") & PackDate < as.Date(str_c("2026",SundayCloseDate))))) |>
+  group_by(Season, Defect, Index) |>
+  summarise(DefectQty = sum(DefectQty),
+            SampleQty = sum(SampleQty),
+            InputKgs = sum(InputKgs),
+            RejectKgs = sum(RejectKgs),
+            .groups = "drop") |>
+  mutate(DefectProp = (DefectQty/SampleQty)*(RejectKgs/InputKgs),
+         DefectPercent = scales::percent(DefectProp, 0.01))
+
+# Calculate top 10 defects for 2025 YTD
+
+Top15 <- DefectSummary |>
+  filter(Season == 2026) |>
+  group_by(Defect) |>
+  summarise(DefectProp = mean(DefectProp, na.rm=T)) |>
+  arrange(DefectProp) |>
+  slice_tail(n=15) |>
+  pull(Defect)
+
+DefectSummary |>
+  filter(Defect %in% Top15) |>
+  mutate(Defect = factor(Defect, levels = Top15)) |>
+  ggplot(aes(Defect, DefectProp,colour=Season, fill=Season)) +
+  geom_col(position = "dodge", alpha = 0.6) +
+  coord_flip() +
+  lims(y=c(0,.08)) +
+  scale_y_continuous("Defect % (as a percentage of total batch)", 
+                     labels =  scales::label_percent(1.0)) +
+  scale_x_discrete(expand = expansion(mult = 0, add=0)) +
+  geom_text(aes(label = DefectPercent, y = DefectProp), size = 1.75, hjust = -0.2,
+            position = position_dodge(width=0.9), colour = "black") +
+  scale_fill_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  scale_colour_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  ggthemes::theme_economist() + 
+  theme(text = element_text(family = "Geograph"),
+        axis.title.x = element_text(margin = margin(t = 7)),
+        axis.title.y = element_text(margin = margin(r = 7)),
+        axis.text.y = element_text(size = 8, hjust=1),
+        axis.text.x = element_text(size = 8),
+        plot.background = element_rect(fill = "#F7F1DF", colour = "#F7F1DF"),
+        plot.title = element_text(margin = margin(b = 10)),
+        legend.text = element_text(size = 8),
+        legend.title = element_text(size = 8),
+        strip.text = element_text(size = 7, margin = margin(b=5, t=5), face = "bold"))
+
+
+```
+
+Blemish cosmetic, Punctures remain, unchanged, as the two most prevalent defects/disorders YTD at week `r currentWeek`, compromising almost 12% of the fruit harvested. Old bruising has now replaced punctures in the number three position with a defect rate of almost 5%. The incidence of stem tears is remain relatively high (5.35%) but consistent week on week and is particularly concerning as this is related largely to the quality of the picking. Bruising is now at 5.0% (almost 2% greater than the same period in 2025) of fruit harvested and is increasing with increased storage time. Spray burn (a new defect in 2026) is currently tracking at 1.23%. Oversize is 1.28% compared to 0.18% in 2025.
+
+The oversize figure for 2026 stated in @fig-DefectProfile is likely to be understating the problem. A separate analysis indicates that oversize fruit may be contributing, on average 8% of the bacth by mass.
+
+## Packed Output
+
+```{r}
+#| label: tbl-PackingSplit
+#| tbl-cap: "Split of packed goods by finished and semi-finished goods and pack site.  Proportions are on an RWE basis"
+
+source("../CommonFunctions/getSQL.r")
+
+con <- DBI::dbConnect(odbc::odbc(),    
+                      Driver = "ODBC Driver 18 for SQL Server", 
+                      Server = "abcrepldb.database.windows.net",  
+                      Database = "ABCPackerRepl",   
+                      UID = "abcadmin",   
+                      PWD = "Trauts2018!",
+                      Port = 1433
+)
+
+PalletDetail <- DBI::dbGetQuery(con, getSQL("../SQLQueryRepo/SQLFiles2024/PalletDetail.sql"))
+
+PackTypeList <- DBI::dbGetQuery(con, 
+                                "SELECT 
+	DISTINCT pk.PackTypeDesc
+FROM sw_ProductT AS pr
+LEFT JOIN
+	sw_Pack_TypeT AS pk
+ON pk.PackTypeID = pr.PackTypeID 
+WHERE pk.PackTypeDesc IS NOT NULL")
+
+DBI::dbDisconnect(con)
+
+PackType <- PackTypeList |>
+  mutate(`Pack format` = case_when(str_detect(PackTypeDesc, "Bin|MB Pack|Tri Post|Z Pack") ~ "Semi-finished goods",
+                                  TRUE ~ "Finished goods")) |>
+  rename(`Pack type` = PackTypeDesc)
+
+PalletDetail2026 <- PalletDetail |>
+  filter(Season == 2026) |>
+  left_join(PackType, by = "Pack type") |>
+  group_by(`Pack format`,`Packing site`) |>
+  summarise(RWEs = sum(RWEs, na.rm=T),
+            .groups = "drop") |>
+  mutate(PropRTEs = RWEs/sum(RWEs)) |>
+  pivot_wider(id_cols = `Packing site`,
+              names_from = `Pack format`,
+              values_from = PropRTEs,
+              values_fill = 0)
+  
+PalletDetail2026Total <- PalletDetail2026 |>
+  summarise(`Finished goods` = sum(`Finished goods`),
+            `Semi-finished goods` = sum(`Semi-finished goods`)) |>
+  mutate(`Packing site` = "Total %") |>
+  relocate(`Packing site`, .before = `Finished goods`)
+
+PalletDetail2026Table <- PalletDetail2026 |>
+  bind_rows(PalletDetail2026Total) |>
+  mutate(`Total %` = `Finished goods`+`Semi-finished goods`,
+         across(.cols = !`Packing site`, ~scales::percent(.,0.01))) 
+
+PalletDetail2026Table |>
+  flextable::flextable() |>
+  set_header_labels(`Finished goods` = "Tubes/Family packs",
+                    `Semi-finished goods` = "MB packs") |>
+  flextable::align(j=c(2:4), align = "right", part = "all") |>
+  flextable::bold(bold = TRUE, part="header") |>
+  flextable::hline(i=c(nrow(PalletDetail2026Table)-1), part = "body") |>
+  flextable::bold(i=c(nrow(PalletDetail2026Table)), bold=T) |>
+  flextable::autofit() |>
+  flextable::fit_to_width(max_width=6)
+
+```
+
+In terms of packing the split by finished goods compared to semi-finished goods (i.e. pack types that will be re-packed into finished goods in market) is currently `r PalletDetail2026Table[[nrow(PalletDetail2026Table),2]]` to `r PalletDetail2026Table[[nrow(PalletDetail2026Table),3]]`. Note that all semi-finished goods are being packed into MB packs to avoid unnecessary mechanical damage while in transit and storage.
+
+## Phytosanitary performance
+
+```{r}
+#| label: tbl-PhytosanitaryPerf
+#| tbl-cap: "Phytosanitary performance for packing to 26 Apr 2026 compared to the same date in 2025 and based on number of MPI lots"
+
+con <- DBI::dbConnect(odbc::odbc(),    
+                      Driver = "ODBC Driver 18 for SQL Server", 
+                      Server = "abcrepldb.database.windows.net",  
+                      Database = "ABCPackerRepl",   
+                      UID = "abcadmin",   
+                      PWD = "Trauts2018!",
+                      Port = 1433
+)
+
+
+PhytoAss <- DBI::dbGetQuery(con,
+                            "SELECT 
+	AssessmentDefectID
+	,qad.AssessmentID
+	,se.SeasonDesc AS Season
+	,qa.GraderBatchID
+	,qa.GraderBatchMPILotID
+	,df.Defect
+	,qad.DefectQty
+	,qa.SampleQty
+	,df.MktDefectCode
+	,qa.AssessmentDateTime
+FROM qa_Assessment_DefectT AS qad
+INNER JOIN
+	qa_DefectT AS df
+ON df.DefectID = qad.DefectID
+INNER JOIN
+	qa_AssessmentT AS qa
+ON qa.AssessmentID = qad.AssessmentID
+INNER JOIN
+    sw_SeasonT AS se
+ON se.SeasonID = qa.SeasonID
+/* This CTE below defines the defects and disorders that exclude Chia and Taiwan*/
+INNER JOIN
+    (
+    SELECT 
+	    DISTINCT pmr.PIPReqID,
+	    pipr.MktDefectCode,
+	    pipr.DeclarationDesc
+	FROM pip_Market_RequirementT AS pmr
+	LEFT JOIN
+	    (
+	    SELECT 
+	       MktDefectCode,
+	       prp.PIPReqID,
+	       PercentLimit,
+	       ThresholdQty,
+	       DeclarationDesc
+	    FROM pip_Requirement_PestT AS prp
+		LEFT JOIN
+		    pip_RequirementT AS pr
+		ON pr.PIPReqID = prp.PIPReqID
+		) AS pipr
+	ON pipr.PIPReqID = pmr.PIPReqID
+	WHERE PIPMarketCode IN ('CHN','TWN')
+	AND ThresholdQty = 0.0000
+	) pip
+ON pip.MktDefectCode = df.MktDefectCode
+WHERE df.MktDefectCode IS NOT NULL
+AND TemplateID = 10")
+
+GraderBatchMPILot <- DBI::dbGetQuery(con,
+                                "SELECT 
+	gbml.GraderBatchMPILotID
+	,gb.GraderBatchID
+	,gbml.MPILotNo
+	,fa.FarmCode AS RPIN
+	,fa.FarmName AS Orchard
+	,sb.SubdivisionCode AS [Production site]
+	,ctp.CompanyName AS [Packing site]
+	,gb.PackDate
+	,gb.HarvestDate
+FROM ma_Grader_Batch_MPI_LotT AS gbml
+LEFT JOIN
+	ma_Grader_BatchT AS gb
+ON gb.GraderBatchID = gbml.GraderBatchID
+LEFT JOIN
+	sw_FarmT AS fa
+ON fa.FarmID = gb.FarmID
+LEFT JOIN
+	sw_SubdivisionT AS sb
+ON sb.SubdivisionID = gb.SubdivisionID
+LEFT JOIN
+	sw_CompanyT AS ctp
+ON ctp.CompanyID = gb.PackingCompanyID")
+
+PIPReq <- DBI::dbGetQuery(con,
+                          "SELECT 
+	gbmlpr.GraderBatchMPILotPIPRequirementID
+	,gbmlpr.GraderBatchMPILotID
+	,gbmlpr.PIPReqID
+	,pr.DeclarationDesc
+	,pr.PIPGroup
+	,prp.MktDefectCode
+	,prp.PercentLimit
+	,prp.ThresholdQty
+FROM ma_Grader_Batch_MPI_Lot_PIP_RequirementT AS gbmlpr
+LEFT JOIN
+	pip_RequirementT AS pr
+ON pr.PIPReqID = gbmlpr.PIPReqID
+LEFT JOIN
+	pip_Requirement_PestT AS prp
+ON prp.PIPReqID = gbmlpr.PIPReqID")
+
+Cartons <- DBI::dbGetQuery(con,
+                           "SELECT 
+    se.SeasonDesc AS Season
+	,GraderBatchMPILotID
+	,COUNT(CartonNo) AS Cartons 
+FROM ma_CartonT AS ct
+INNER JOIN
+   sw_SeasonT AS se
+ON se.SeasonID = ct.SeasonID
+WHERE CartonExistsFlag = 1
+GROUP BY se.SeasonDesc, GraderBatchMPILotID")
+
+MPILots <- DBI::dbGetQuery(con,
+                           "SELECT 
+    GraderBatchMPILotID
+	,gb.GraderBatchID
+	,PackDate
+	,se.SeasonDesc AS Season
+FROM ma_Grader_Batch_MPI_LotT AS gbml
+LEFT JOIN
+	ma_Grader_BatchT AS gb
+ON gb.GraderBatchID = gbml.GraderBatchID
+LEFT JOIN
+	sw_SeasonT AS se
+ON se.SeasonID = gb.SeasonID")
+
+DBI::dbDisconnect(con)
+
+phytoAssSummary <- PhytoAss  |>
+  group_by(GraderBatchMPILotID, Defect, MktDefectCode) |>
+  summarise(Season = max(Season, na.rm=T),
+            DefectQty = sum(DefectQty, na.rm = T),
+            SampleQty = sum(SampleQty, na.rm = T),
+            .groups = "drop") |>
+  left_join(GraderBatchMPILot, by = "GraderBatchMPILotID") #|>
+# filter for Te Ipu MPI lots only
+#  filter(`Packing site` == "Te Ipu Packhouse (RO)")
+  
+temp <- phytoAssSummary |>
+  left_join(PIPReq, by = c("GraderBatchMPILotID", "MktDefectCode")) |>
+  filter(!is.na(PIPReqID)) |>
+  mutate(storageDays = as.integer(PackDate - HarvestDate))
+
+#===============================================================================
+
+buggedOutMPILots <- temp |>
+  filter(!(MktDefectCode %in% c("LLT", "ROT009"))) |>
+  filter((Season == "2025" & PackDate <= as.Date(str_c("2025",SundayCloseDate))) | 
+           (Season == "2026" & PackDate <= as.Date(str_c("2026",SundayCloseDate)))) |>
+  ungroup() |>
+  group_by(Season, GraderBatchMPILotID) |>
+  summarise(interceptions = n(),
+            .groups = "drop") |>
+  group_by(Season) |>
+  summarise(`With interceptions` = n())
+
+MPILotSummary <- MPILots  |>
+  filter((Season == "2025" & PackDate <= as.Date(str_c("2025",SundayCloseDate))) | 
+           (Season == "2026" & PackDate <= as.Date(str_c("2026",SundayCloseDate)))) |>
+  group_by(Season) |>
+  summarise(Total = n()) |>
+  arrange(Season) 
+
+boMPILotSummary <- buggedOutMPILots |>
+  inner_join(MPILotSummary, by = "Season") |>
+  mutate(`% bugged out` = `With interceptions`/Total) 
+  
+
+boMPILotSummary |>
+  mutate(`% bugged out` = scales::percent(`% bugged out`, accuracy = 0.1)) |>
+  flextable::flextable() |>
+  flextable::add_header_row(colwidths = c(1, 3),
+                 values = c(" ", "MPI lots")) |>
+  flextable::align(align = "center", part = "header") |> 
+  flextable::align(j=4, align = "right", part = "body") |>
+  flextable::width(j=c(2), width = 1.2, unit="in") |>
+  flextable::bold(bold = TRUE, part="header") |>
+  footnote(i=1, j=2, value = as_paragraph(
+    c("This table only includes MPI lots run at Te Ipu")), 
+    part = "header") |>
+  fontsize(size = 9, part="footer") |>
+  flextable::autofit() |>
+  flextable::fit_to_width(max_width=6)
+
+```
+
+```{r}
+#| label: tbl-BOByRWE
+#| tbl-cap: "Bugged out finished and semi-finished goods on an RWE basis as of the 26 Apr 2026"
+
+con <- DBI::dbConnect(odbc::odbc(),    
+                      Driver = "ODBC Driver 18 for SQL Server", 
+                      Server = "abcrepldb.database.windows.net",  
+                      Database = "ABCPackerRepl",   
+                      UID = "abcadmin",   
+                      PWD = "Trauts2018!",
+                      Port = 1433
+)
+
+RWEsByMPILot <- DBI::dbGetQuery(con, "SELECT * FROM shiny_RWEs_By_MPI_LotV")
+
+ExcludedMPILots <- DBI::dbGetQuery(con, "SELECT 
+    mp.GraderBatchMPILotID,
+    mp.GraderBatchID,
+    ma.MarketCode
+FROM ma_Grader_Batch_MPI_LotT AS mp
+CROSS JOIN sw_MarketT AS ma
+LEFT JOIN
+	ma_Grader_BatchT AS gb
+ON gb.GraderBatchID = mp.GraderBatchID
+WHERE ma.ActiveFlag = 1
+AND ma.MarketCode IN ('CHN', 'TWN')  -- filter to markets of interest
+AND NOT EXISTS (
+    SELECT 1
+    FROM ma_Grader_Batch_MPI_Lot_Provisional_Market_ClearanceT AS mc
+    WHERE mc.GraderBatchMPILotID = mp.GraderBatchMPILotID
+    AND mc.MarketID = ma.MarketID
+)
+AND gb.SeasonID = dbo.Fn_Get_Current_SeasonID()
+ORDER BY mp.GraderBatchMPILotID, ma.MarketCode")
+
+DBI::dbDisconnect(con)
+
+# Te Ipu Packing site only
+TotalRWEs <- RWEsByMPILot |>
+  filter((Season == "2026" & PackDate <= as.Date(str_c("2026",SundayCloseDate))),
+         `Packing site` == "Te Ipu Packhouse (RO)") |>
+  summarise(TotalRWEs = sum(RWEs)) |>
+  mutate(`Packing site` = "Total") |>
+  relocate(`Packing site`, .before = TotalRWEs) 
+
+RWEByPackSite <- RWEsByMPILot |>
+  filter((Season == "2026" & PackDate <= as.Date(str_c("2026",SundayCloseDate))),
+         `Packing site` == "Te Ipu Packhouse (RO)") |>
+  summarise(TotalRWEs = sum(RWEs)) |>
+  bind_rows(TotalRWEs)
+
+buggedOutRWEs <- temp |>
+  filter(!(MktDefectCode %in% c("LLT", "ROT009"))) |>
+  filter((Season == "2026" & PackDate <= as.Date(str_c("2026",SundayCloseDate)))) |>
+  ungroup() |>
+  group_by(Season, GraderBatchMPILotID) |>
+  summarise(interceptions = n(),
+            .groups = "drop") |>
+  left_join(RWEsByMPILot, by = "GraderBatchMPILotID") |>
+  summarise(RWEs = sum(RWEs)) |>
+  mutate(TotalRWEs = TotalRWEs$TotalRWEs[[1]],
+         PercentBORWEs = scales::percent(RWEs/TotalRWEs,0.01))
+
+buggedOutRWEs |>
+  mutate(across(.cols = c(RWEs,TotalRWEs), ~scales::comma(.,1.0))) |>
+  flextable() |>
+  set_header_labels(
+    RWEs = "Excluded",
+    TotalRWEs = "Total",
+    PercentBORWEs = "% Bugged out"
+  ) |>
+  add_header_row(
+    values = c("RWEs"),
+    colwidths = c(3)
+  ) |>
+  align(align = "center", part = "header") |>
+  align(align = "right", part = "body") |>
+  bold(bold = TRUE, part = "header") |>
+  footnote(i=1, j=1, value = as_paragraph(
+    c("This table only includes MPI lots run at Te Ipu")), 
+    part = "header") |>
+  fontsize(size = 9, part="footer") |>
+  flextable::autofit() |>
+  flextable::fit_to_width(max_width=6) 
+
+```
+
+@Tbl-PhytosanitaryPerf shows the relative phytosanitary performance tallied by MPI lots (these are sub-batches which are individually evaluated for phytosanitary pests and diseases) for the first `r as.numeric(as.Date(str_c("2026",SundayCloseDate))-MinPD$minPD[[2]])` days of packing in 2026 compared to 2025. As can be observed `r boMPILotSummary[[2,2]]` MPI lots out of `r scales::comma(boMPILotSummary[[2,3]],1.0)` (`r scales::percent(boMPILotSummary[[2,4]],0.1)`) suffered a phytosanitary pest interception (predominantly ALCM and Long Tailed Mealybug). This compares to `r scales::percent(boMPILotSummary[[1,4]],1.0)` observed for the same dates in 2025.
+
+In terms of RWEs (the new unit of measure launched in 2026) The percentage of bugged out fruit is similar to MPI Lots at `r buggedOutRWEs$PercentBORWEs[[1]]`. Both metrics will be presented in this report as the RWE percentage does not have a comparison from previous seasons.
+
+## Fruit size distribution
+
+```{r}
+#| label: fig-sizeDistribution
+#| fig-cap: "apple size distribution (measured by equatorial diameter) for fruit packed up to 26 Apr 2026 compared with the same date for the previous three seasons" 
+#| fig-align: center
+#| out-width: 96%
+#| fig-asp: 0.8
+
+con <- DBI::dbConnect(odbc::odbc(), 
+                      dsn = "RockIt", 
+                      uid="stuart.dykes@rockitapple.com", 
+                      authenticator = "externalbrowser"
+)
+
+meanSizeSummaries <- tbl(con, "STG_COMPAC_BATCH") |>
+  mutate(Season = case_when(START_TIME >= as.POSIXct('2023-01-01 00:00:00.000') & 
+                              START_TIME < as.POSIXct('2024-01-01 00:00:00.000') ~ 2023,
+                            START_TIME >= as.POSIXct('2024-01-01 00:00:00.000') & 
+                              START_TIME < as.POSIXct('2025-01-01 00:00:00.000') ~ 2024,
+                            START_TIME >= as.POSIXct('2025-01-01 00:00:00.000') & 
+                              START_TIME < as.POSIXct('2026-01-01 00:00:00.000') ~ 2025,
+                            START_TIME >= as.POSIXct('2026-01-01 00:00:00.000') & 
+                              START_TIME < as.POSIXct('2027-01-01 00:00:00.000') ~ 2026,
+                            TRUE ~ 2022)) |>
+  filter((Season == 2023 & START_TIME > as.POSIXct('2023-01-01 00:00:00.000') &
+           START_TIME <= as.POSIXct(str_c('2023',SundayCloseDate,' 00:00:00.000'))) |
+           (Season == 2024 & START_TIME > as.POSIXct('2024-01-01 00:00:00.000') &
+              START_TIME <= as.POSIXct(str_c('2024',SundayCloseDate,' 00:00:00.000'))) |
+           (Season == 2025 & START_TIME > as.POSIXct('2025-01-01 00:00:00.000') &
+              START_TIME <= as.POSIXct(str_c('2025',SundayCloseDate,' 00:00:00.000'))) |
+           (Season == 2026 & START_TIME > as.POSIXct('2026-01-01 00:00:00.000') &
+              START_TIME <= as.POSIXct(str_c('2027',SundayCloseDate,' 00:00:00.000'))),
+         !(SIZER_GRADE_NAME %in% c('Capture','Rcy','Capture','Recycle','Doub','Doubles','Capt','Ai',
+                                  'Leaf','Cap')),
+         BATCH_ID != 0) |>
+  dplyr::select(c(Season, BATCH_ID, GROWER_NAME, GROWER_CODE, MINOR, MAJOR, WEIGHT,VOLUME, 
+                  SIZE_NAME, SIZER_GRADE_NAME, START_TIME)) |>
+  filter(MINOR > 30,
+         MAJOR > 30) |>
+  mutate(elong = MAJOR/MINOR) |>
+  group_by(Season) |>
+  summarise(meanEQ = mean(MINOR, na.rm=T),
+            sdEQ = sd(MINOR, na.rm=T),
+            meanSL = mean(MAJOR, na.rm=T),
+            sdSL = sd(MAJOR, na.rm=T),
+            meanElong = mean(elong, na.rm=T),
+            sdElong = sd(elong, na.rm=T),
+            covar = cov(MINOR, elong),
+            meanMass = mean(WEIGHT, na.rm=T),
+            sdMass = sd(WEIGHT, na.rm=T),
+            meanVol = mean(VOLUME, na.rm=T),
+            sdVol = sd(VOLUME, na.rm=T)) |>
+  collect() |>
+  arrange(Season) |>
+  mutate(Season = factor(Season))
+
+DBI::dbDisconnect(con)
+
+set.seed(123)
+
+ggplot(data = tibble(x=c(36,76)), aes(x)) +
+  stat_function(fun = dnorm, args = list(mean = meanSizeSummaries[[1,2]], sd=meanSizeSummaries[[1,3]]),
+                colour = "#526280", linewidth = 1) +
+  stat_function(fun = dnorm, args = list(mean = meanSizeSummaries[[2,2]], sd=meanSizeSummaries[[2,3]]),
+                colour = "#f6c15f", linewidth = 1) +
+  stat_function(fun = dnorm, args = list(mean = meanSizeSummaries[[3,2]], sd=meanSizeSummaries[[3,3]]),
+                colour = "#a9342c", linewidth = 1) +
+  stat_function(fun = dnorm, args = list(mean = meanSizeSummaries[[4,2]], sd=meanSizeSummaries[[4,3]]),
+                colour = "#48762e", linewidth = 1) +
+  geom_vline(aes(xintercept = meanEQ, colour=Season), data = meanSizeSummaries) +
+  scale_colour_manual(values = c("#526280","#f6c15f","#a9342c","#48762e")) +
+  labs(x = "Equatorial diameter / mm",
+       y = "density") +
+  ggthemes::theme_economist() + 
+  theme(text = element_text(family = "Geograph"),
+        axis.title.x = element_text(margin = margin(t = 7),size = 12,face="bold",colour="#48762e"),
+        axis.title.y = element_text(margin = margin(r = 7),size = 12,face="bold",colour="#48762e"),
+        axis.text.y = element_text(size = 12, hjust=1,face="bold",colour="#48762e"),
+        axis.text.x = element_text(size = 12,face="bold",colour="#48762e"),
+        plot.background = element_rect(fill = "#F7F1DF", colour = "#F7F1DF"),
+        plot.title = element_text(margin = margin(b = 10)),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 12,face="bold"))
+
+#ggsave(
+#  "SizeDistr.png",
+#  device = ragg::agg_png,
+#  width = 10,
+#  height = 7,
+#  units = "in",
+#  dpi = 300
+#)
+
+```
+
+```{r}
+#| label: tbl-sizeDistribution
+#| tbl-cap: "Mean equatorial diameter (mm) by season and percentage change from the previous year"
+
+DiameterSummary <- meanSizeSummaries |>
+  select(Season, meanEQ) |>
+  mutate(YoYChange = (meanEQ/lag(meanEQ))-1,
+         meanEQ = round(meanEQ, 1)) 
+
+DiameterSummary |>
+  mutate(YoYChange = scales::percent(YoYChange, 0.1)) |>
+  flextable::flextable() |>
+  flextable::fontsize(size=10,part="all") |>
+  flextable::set_header_labels(values = c("Season","mm","%")) |>
+  flextable::add_header_row(colwidths = c(1,1,1),
+                 values = c(" ", "Diameter", "YoY change")) |>
+  flextable::align(j=c(2,3), align = "right", part = "all") |>
+  flextable::bold(bold = TRUE, part="header") |>
+  flextable::autofit() |>
+  flextable::fit_to_width(max_width=6)
+
+
+```
+
+Size distribution is generally measured using the equatorial diameter of the apple (corresponding with the diameter of the tube). The respective distributions for 2023 through 2026 seasons (note these included batches packed up to 26 Apr for each season) are shown in @fig-sizeDistribution and @tbl-sizeDistribution. Note the close correspondence of the 2023 and 2025 season (around 57mm) compared to the 2024 season (55mm). Very early indications are that 2026 will be a relatively large year with mean equatorial diameter being currently recorded at `r DiameterSummary$meanEQ[[4]]`mm.
+
+A `r scales::percent(DiameterSummary$YoYChange[[3]],0.1)` increase in diameter was observed between 2024 and 2025, compared to a corresponding `r scales::percent(DiameterSummary$YoYChange[[4]],0.1)` increase from 2025 to season to date 2026. Note that the early fruit size will develop as the season progresses as well as orchard-to-orchard variability.
+
+
+## Summary Table
+
+```{r}
+#| label: tbl_SummaryTable
+#| tbl-cap: "Summary table comparing season-to-date metrics as of the 26 Apr 2026"
+
+# Bins Picked
+
+BinHarvested |>
+  relocate(`2026`, .before = `2025`) |>
+  rename(!!sym(str_c("Week ",wkc)) := `2026`,
+         YearlyChange = Change) |>
+  mutate(!!sym(str_c("Week ",wkcM1)) := 65186,
+         WeeklyChange = (!!sym(str_c("Week ",wkc))-!!sym(str_c("Week ",wkcM1)))/!!sym(str_c("Week ",wkcM1)),
+         across(.cols = c(!!sym(str_c("Week ",wkcM1)),!!sym(str_c("Week ",wkc)),`2025`), ~scales::comma(.,1.0)),
+         across(.cols = c(WeeklyChange,YearlyChange),~scales::percent(.,0.1))) |>
+  relocate(!!sym(str_c("Week ",wkcM1)), .after = !!sym(str_c("Week ",wkc))) |>
+  relocate(WeeklyChange, .after = !!sym(str_c("Week ",wkcM1))) |>
+# Fruit diameter
+  bind_rows(DiameterSummary |>
+              filter(Season %in% c(2025,2026)) |>
+              select(c(Season, meanEQ)) |>
+              pivot_wider(names_from = Season,
+                          values_from = meanEQ) |>
+              relocate(`2026`, .before = `2025`) |>
+              rename(!!sym(str_c("Week ",wkc)) := `2026`) |>
+              mutate(!!sym(str_c("Week ",wkcM1)) := 62.9,
+                     WeeklyChange = (!!sym(str_c("Week ",wkc))-!!sym(str_c("Week ",wkcM1)))/!!sym(str_c("Week ",wkcM1)),
+                     YearlyChange = (!!sym(str_c("Week ",wkc))-`2025`)/`2025`,
+                     across(.cols = c(!!sym(str_c("Week ",wkcM1)),!!sym(str_c("Week ",wkc)),`2025`), ~scales::comma(.,0.1)),
+                     across(.cols = c(WeeklyChange,YearlyChange),~scales::percent(., 0.1)),
+                     " " = "Avg fruit diameter /mm (STD)") |>
+              relocate(`2025`,.after = WeeklyChange) |>
+              relocate(` `, .before = !!sym(str_c("Week ",wkc)))) |>
+# Bins packed
+  bind_rows(BinsPacked |>
+              rename(!!sym(str_c("Week ",wkc)) := `2026`) |>
+              mutate(!!sym(str_c("Week ",wkcM1)) := 18460,
+                     WeeklyChange = (!!sym(str_c("Week ",wkc))-!!sym(str_c("Week ",wkcM1)))/!!sym(str_c("Week ",wkcM1)),
+                     YearlyChange = (!!sym(str_c("Week ",wkc))-`2025`)/`2025`,
+                     across(.cols = c(!!sym(str_c("Week ",wkcM1)),!!sym(str_c("Week ",wkc)),`2025`), ~scales::comma(.,1.0)),
+                     across(.cols = c(WeeklyChange,YearlyChange),~scales::percent(., 0.1)),
+                     " " = "Bins packed (STD)") |>
+              relocate(`2025`, .after = WeeklyChange) |>
+              relocate(` `, .before = !!sym(str_c("Week ",wkc)))) |>
+# Bins Per Shift
+  bind_rows(YTDSummary |>
+              rename(!!sym(str_c("Week ",wkc)) := !!sym(str_c("2026_",wkc)),
+                     !!sym(str_c("Week ",wkcM1)) := !!sym(str_c("2026_",wkcM1)),
+                      `2025` = !!sym(str_c("2025_",wkc))) |>
+              mutate(across(.cols = c(!!sym(str_c("Week ",wkcM1)),!!sym(str_c("Week ",wkc)),`2025`), ~scales::comma(.,1.0)),
+                     across(.cols = c(YearlyChange, WeeklyChange), ~scales::percent(., 0.1)),
+                     " " = "Bins packed per shift (STD)") |>
+              relocate(`2025`, .after = WeeklyChange) |>
+              relocate(` `, .before = !!sym(str_c("Week ",wkc)))) |>
+# PrimaryPackout
+  bind_rows(Packout |>
+              rename(!!sym(str_c("Week ",wkc)) := `2026`) |>
+              mutate(!!sym(str_c("Week ",wkcM1)) := 0.6609,
+                     WeeklyChange = !!sym(str_c("Week ",wkc))-!!sym(str_c("Week ",wkcM1)),
+                     YearlyChange = !!sym(str_c("Week ",wkc))-`2025`,
+                     across(.cols = c(!!sym(str_c("Week ",wkcM1)),!!sym(str_c("Week ",wkc)),`2025`), ~scales::percent(.,0.01)),
+                     across(.cols = c(YearlyChange, WeeklyChange), ~scales::percent(., 0.1)),
+                     " " = "Primary packout") |>
+              relocate(`2025`, .after = WeeklyChange) |>
+              relocate(` `, .before = !!sym(str_c("Week ",wkc)))) |>
+# Market Access
+  bind_rows(boMPILotSummary |>
+              select(c(Season, `% bugged out`)) |>
+              pivot_wider(names_from = Season,
+                          values_from = `% bugged out`,
+                          values_fill = 0) |>
+              rename(!!sym(str_c("Week ",wkc)) := `2026`) |>
+              mutate(!!sym(str_c("Week ",wkcM1)):= 0.0922,
+                     WeeklyChange = !!sym(str_c("Week ",wkc)) - !!sym(str_c("Week ",wkcM1)),
+                     YearlyChange = !!sym(str_c("Week ",wkc))-`2025`,
+                     across(.cols = c(!!sym(str_c("Week ",wkcM1)),!!sym(str_c("Week ",wkc)),`2025`), ~scales::percent(.,0.01)),
+                     across(.cols = c(YearlyChange, WeeklyChange), ~scales::percent(., 0.1)),
+                     " " = "Excluded lots from China (by MPI Lots)") |>
+              relocate(`2025`, .after = WeeklyChange) |>
+              relocate(` `, .before = !!sym(str_c("Week ",wkc)))) |>
+# Containers Shipped
+  bind_rows(tibble(` ` = "Containers shipped (YTD)",
+                 `2025` = scales::comma(219,1.0),
+                 !!sym(str_c("Week ",wkc)) := scales::comma(227,1.0),
+                 !!sym(str_c("Week ",wkcM1)) := scales::comma(175,1.0),
+                 WeeklyChange = scales::percent((227-175)/175),
+                 YearlyChange = scales::percent((227-219)/219,0.1)) |>
+              relocate(`2025`, .after = WeeklyChange)) |>
+  flextable() |>
+  bold(bold = TRUE, part = "header") |>
+  align(j=c(2:6), align = "right", part = "body") |>
+  align(j=c(2:6), align = "center", part = "header") |>
+  set_header_labels(WeeklyChange = "% change",
+                    YearlyChange = "% change",
+                    `2025` = str_c("Week ",wkc)) |>
+  add_header_row(top = T, values = c(" ","2026", "2025"),
+                 colwidths = c(1,3,2)) |>
+  footnote(i=4,j=1,value = as_paragraph("Te Ipu batches only")) |>
+  flextable::autofit() |>
+  flextable::fit_to_width(max_width=6) 
+  
+
+
+```
