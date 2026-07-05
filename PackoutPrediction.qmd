@@ -1,0 +1,848 @@
+---
+title: "PackoutPrediction2026"
+subtitle: "Season-to-date ISO-week 27"
+  
+date: 07/05/2026
+date-format: long
+
+mainfont: Geograph
+monofont: Geograph
+sansfont: Geograph
+
+prefer-html: true
+always_allow_html: yes
+
+params:
+  close_date: "2026-07-05"
+
+format: docx
+---
+
+```{r}
+#| label: initialisation
+#| message: false
+#| warning: false
+#| echo: false
+
+library(tidyverse)
+library(lubridate)
+library(flextable)
+library(ragg)
+
+knitr::opts_chunk$set(echo = F, message = F, warning = F)
+
+source("../CommonFunctions/getSQL.r")
+
+SundayCloseDate <- "-07-05"
+SundayCloseMonth <- 7
+SundayCloseDay <- 5
+YearDay <- yday(as.Date(str_c("2026",SundayCloseDate)))
+
+currentWeek <- isoweek(as.Date(str_c("2026",SundayCloseDate)))
+
+close_date <- as.Date(str_c("2026",SundayCloseDate))
+
+
+```
+
+```{r}
+#| label: data-POPred
+
+con <- DBI::dbConnect(odbc::odbc(),    
+                      Driver = "ODBC Driver 18 for SQL Server", 
+                      Server = "abcrepldb.database.windows.net",  
+                      Database = "ABCPackerRepl",   
+                      UID = "abcadmin",   
+                      PWD = "Trauts2018!",
+                      Port = 1433
+)
+
+GBV2024 <- DBI::dbGetQuery(con, "SELECT * FROM ma_Grader_BatchV")
+
+BDV2024 <- DBI::dbGetQuery(con, "SELECT * FROM ma_Bin_DeliveryV")
+
+Class152 <- DBI::dbGetQuery(con, "SELECT
+GraderBatchID
+,ISNULL([Class 1.5],0) AS [Class 1.5]
+,ISNULL([Class 2],0) AS [Class 2]
+FROM (
+  SELECT
+  GraderBatchID,
+  GradeDesc,
+  SUM(KGs) AS KGs
+  FROM [dbo].[shiny_class15_KGsV]
+  GROUP BY
+  GraderBatchID,
+  GradeDesc
+) AS src
+PIVOT (
+  SUM(KGs)
+  FOR GradeDesc IN (
+    [Class 1.5],
+    [Class 2]
+  )
+) AS pvt;")
+
+LibSamp <- DBI::dbReadTable(con, "shiny_Rework_KGsV")
+
+DBI::dbDisconnect(con)
+
+PackOutPlotSumRaw <- GBV2024 |>
+  filter(Presize == "Field bin",
+         BatchStatus == "Closed",
+         !is.na(RejectKgs)) |>
+  left_join(Class152, by = "GraderBatchID") |>
+  left_join(LibSamp |> 
+              rename(LibSampKGs = KGs) |>
+              dplyr::select(GraderBatchID, LibSampKGs), 
+            by = "GraderBatchID") |>
+  mutate(StorageDays = as.numeric(PackDate-HarvestDate),
+         across(.cols = c(`Class 1.5`, `Class 2`, LibSampKGs), ~replace_na(.,0)),
+         `Class 1 kgs` = InputKgs - RejectKgs - `Class 1.5` - `Class 2` - LibSampKGs,
+         Packout1 = `Class 1 kgs`/InputKgs,
+         Packout2 = 1-(RejectKgs/InputKgs),
+         YearDays = yday(PackDate))
+
+PackOutPlotSum <- PackOutPlotSumRaw |>
+  filter(YearDays <= YearDay) 
+
+AggPackout <- PackOutPlotSum |>
+  group_by(Season) |>
+  summarise(InputKgs = sum(InputKgs),
+            `Class 1 kgs` = sum(`Class 1 kgs`),
+            RejectKgs = sum(RejectKgs)) |>
+  mutate(Packout1 = `Class 1 kgs`/InputKgs,
+         Packout2 = 1-(RejectKgs/InputKgs),
+         DiffPackout = scales::percent(Packout2-Packout1,0.1)) 
+```
+
+
+## Packout prediction model development {#sec-modeldevel}
+
+An attempt at modeling the trend for this years packout is shown on @fig-PackoutPlot. The behaviour of packout with storage days (for RA) is non-linear and can be defined by the following relationship for batch $i$:
+
+**Formal model equation**
+
+The model fitted is a nonlinear fixed-effects regression with a group-specific asymptote, i.e.:. 
+
+$$Packout_{ij}=\alpha e^{\beta⋅t_i}+θj+\epsilon_{ij}$${#eq-RAPackout}
+
+where $\varepsilon_{ij} \sim \mathcal{N}(0, \sigma^2)$
+
+and the RSP-specific asymptote is:
+
+$$\theta_j = \theta_A + \delta_B \cdot \mathbf{1}[j = B] + \delta_C \cdot \mathbf{1}[j = C]$${#eq-AsympFunc}
+
+So the conditional expectation is:
+
+$$\mathbb{E}[\text{Packout}_{ij} \mid t_i, j] = \alpha \cdot e^{\beta \cdot t_i} + \theta_j$${#eq-condExp}
+
+Where:  
+
+$\text{Packout}_{ij}$ = Packout proportion for batch $i$ under submission profile $j$  
+$t_{i}$ = Storage days for batch $i$  
+$j \in \{A, B, C\}$ = RSP submission profile    
+$\alpha$ = αAmplitude — the maximum decay range above the asymptote  
+$\beta < 0$ = Decay rate (negative, governing speed of quality loss)  
+$\theta_{j}$ = RSP-specific asymptote (long-run packout floor for profile $j$  
+$\theta_{A}$ = Baseline asymptote (reference level, RSP = A)  
+$\delta_{B},\delta_{C}$ = Asymptote offsets for RSP B and C relative to A   
+$\mathbf{1}[\cdot]$ = Indicator function  
+$\varepsilon_{ij}$ = Residual error, assumed i.i.d. normal  
+
+
+A few things worth stating explicitly about the model assumption: 
+
+α and β are assumed common across RSP profiles — the model posits that submission profiles differ in their *long-run packout floor* ($\theta_j$) but not in the *rate* or *amplitude* of decay. 
+
+On the asymptote constraint. As $t_{i} \to \infty$
+, $\mathbb{E}[\text{Packout}_{ij}] \to \theta_j$, so $\theta_j$ has a direct practical interpretation as the minimum expected packout under indefinite storage for profile $j$.
+
+The model parameters for the RA packout component for 2026 (YTD) are given in @tbl-RAReresModel based on @eq-RAPackout.  Note the difference between the asymptote values (θ) for each RSP. RSP A is 3.9% and 6.8% greater than RSP B & C respectively. 
+
+```{r}
+#| label: data-RAReresModel
+
+df <- PackOutPlotSumRaw %>%
+  filter(`Storage type` != "CA Smartfresh",
+         RSP != "X (Pressure)",
+         Season == "2026") %>%
+  mutate(RSP = factor(RSP, levels = c("A", "B", "C")))  # A is reference
+
+# One theta per RSP level (intercept + 2 contrasts)
+NLmodel_RSP_theta <- nls(
+  Packout1 ~ alpha * exp(beta * StorageDays) + 
+    theta_A * (RSP == "A") + 
+    theta_B * (RSP == "B") + 
+    theta_C * (RSP == "C"),
+  data = df,
+  control = nls.control(maxiter = 1000),
+  start = list(alpha = 0.1, beta = -0.1, 
+               theta_A = 0.60, theta_B = 0.58, theta_C = 0.62)
+)
+
+#summary(NLmodel_RSP_theta)$coef
+
+RAModParams <- tibble(RSP = c("A","B","C"),
+        `Zero storage day packout` = c(summary(NLmodel_RSP_theta)$coef[[1]]+
+                                         summary(NLmodel_RSP_theta)$coef[[3]],
+                                       summary(NLmodel_RSP_theta)$coef[[1]]+
+                                         summary(NLmodel_RSP_theta)$coef[[4]],
+                                       summary(NLmodel_RSP_theta)$coef[[1]]+
+                                         summary(NLmodel_RSP_theta)$coef[[5]]),
+       `Rate of decay` = c(summary(NLmodel_RSP_theta)$coef[[2]]),
+       `Packout asymptote` = c(summary(NLmodel_RSP_theta)$coef[[3]],
+                               summary(NLmodel_RSP_theta)$coef[[4]],
+                               summary(NLmodel_RSP_theta)$coef[[5]]))
+
+RAModParams |>
+  mutate(across(.cols = -RSP, ~scales::percent(.,0.01))) |>
+  flextable() |>
+  add_header_row(values = c("","(α + θ) %","(β) %/day","(θ) %"),
+                 colwidths = c(1,1,1,1), top = F) |>
+  align(j=c(2:4), align="right", part = "body") |>
+  align(j=c(2:4), align = "center", part = "header") |>
+  footnote(i=1,j=3,value = as_paragraph(
+    c("This represents the % or relative change in packout per day rather than the absolute #change")), 
+    part = "header") |>
+  fontsize(size = 9, part = "footer") |>
+  flextable::autofit() |>
+  flextable::fit_to_width(max_width=6.5)
+
+```
+
+## Packing plan by Storage type and RSP {#sec-PackingPlan}
+
+The packing plan (essentially the draw down of bins from storage into packing) is given in @fig-BinPlan) for the remainder of the packing season.  The two plots show the RA and CA bin draw downs respectively by ISO week.  Each line represents the remaining number of each RSP.  The plan follows two general rules:
+
+* RA before CA and 
+* RSP C before RSP B before RSP A 
+
+
+```{r}
+#| label: fig-BinPlan
+#| fig-cap: !expr paste0("Bin plan for the remainder of the season as at ",format(as.Date(str_c("2026",SundayCloseDate)), format = "%d %b %Y"))
+
+cutoff_date <- as.Date(str_c("2026",SundayCloseDate))
+
+BinSRemBySTAndRSP  <- glue::glue("
+SELECT 
+CASE
+WHEN bd.StorageTypeID = 4 THEN 'CA'
+ELSE 'RA'
+END AS [Storage type]
+,ma.MaturityCode AS RSP
+,SUM(bu.BinQty) AS BinQty 
+FROM ma_Bin_UsageT AS bu
+LEFT JOIN 
+ma_Bin_DeliveryT AS bd
+ON bd.BinDeliveryID = bu.BinDeliveryID
+LEFT JOIN 
+ma_Grader_BatchT AS gb
+ON gb.GraderBatchID = bu.GraderBatchID
+LEFT JOIN
+sw_MaturityT AS ma
+ON ma.MaturityID = bd.MaturityID
+WHERE bd.SeasonID = 2013
+AND bd.PresizeFlag = 0
+AND 
+(
+  bu.GraderBatchID IS NULL
+  OR gb.PackDate > '{cutoff_date}'
+)
+GROUP BY
+CASE
+WHEN bd.StorageTypeID = 4 THEN 'CA'
+ELSE 'RA'
+END
+,ma.MaturityCode
+")
+
+con <- DBI::dbConnect(odbc::odbc(),    
+                     Driver = "ODBC Driver 18 for SQL Server", 
+                     Server = "abcrepldb.database.windows.net",  
+                     Database = "ABCPackerRepl",   
+                     UID = "abcadmin",   
+                     PWD = "Trauts2018!",
+                     Port = 1433
+)
+
+BinsRemainingSTAndRSP <- DBI::dbGetQuery(con, BinSRemBySTAndRSP) 
+  
+DBI::dbDisconnect(con)
+
+PackingPlan2026 <- read_csv("data/PackingPlan20260630.csv", show_col_types = F)
+
+CAC <- tibble(`Storage type` = "CA",
+              RSP = "C",
+              BinQty = 0)
+
+BinsRemainingSTAndRSP <- BinsRemainingSTAndRSP |>
+  bind_rows(CAC) |>
+  arrange(`Storage type`,RSP)
+
+BinTipPlanRSP <- PackingPlan2026 |>
+  filter(`ISO Week` >= currentWeek+1) |>
+  mutate(RABinsTippedC = 0,
+         RABinsTippedB = 0,
+         RABinsTippedA = 0,
+         RemainingRABinsC = 0,
+         RemainingRABinsB = 0,
+         RemainingRABinsA = 0,
+         CABinsTippedC = 0,
+         CABinsTippedB = 0,
+         CABinsTippedA = 0,
+         RemainingCABinsC = 0,
+         RemainingCABinsB = 0,
+         RemainingCABinsA = 0
+         )
+
+#write_csv(BinTipPlanRSP,"BinTipPlanRSP.csv")
+
+RemainingRA <- tibble(C = BinsRemainingSTAndRSP$BinQty[[6]],
+                      B = BinsRemainingSTAndRSP$BinQty[[5]],
+                      A = BinsRemainingSTAndRSP$BinQty[[4]])
+
+#write_csv(RemainingRA,"RemainingRA.csv")
+
+RemainingCA <- tibble(C = BinsRemainingSTAndRSP$BinQty[[3]],
+                      B = BinsRemainingSTAndRSP$BinQty[[2]],
+                      A = BinsRemainingSTAndRSP$BinQty[[1]])
+
+#write_csv(RemainingCA,"RemainingCA.csv")
+
+# ── Opening stocks ─────────────────────────────────────────────────────────────
+ra_open <- c(C = RemainingRA$C, B = RemainingRA$B, A = RemainingRA$A)
+ca_open <- c(C = RemainingCA$C, B = RemainingCA$B, A = RemainingCA$A)
+
+# ── Helper: draw bins sequentially from C→B→A within a pool ───────────────────
+# Returns a list: tipped = named vector (C,B,A), remaining = named vector (C,B,A)
+draw_bins <- function(pool, demand) {
+  tipped <- c(C = 0, B = 0, A = 0)
+  for (grade in c("C", "B", "A")) {
+    take        <- min(pool[grade], demand)
+    tipped[grade] <- take
+    pool[grade]   <- pool[grade] - take
+    demand        <- demand - take
+    if (demand == 0) break
+  }
+  list(tipped = tipped, remaining = pool, leftover = demand)
+}
+
+# ── Row-by-row simulation ──────────────────────────────────────────────────────
+ra_pool <- ra_open
+ca_pool <- ca_open
+
+results <- vector("list", nrow(BinTipPlanRSP))
+
+for (i in seq_len(nrow(BinTipPlanRSP))) {
+  demand <- BinTipPlanRSP$TotalBins[i]
+  
+  # 1. Draw from RA first
+  ra_draw  <- draw_bins(ra_pool, demand)
+  ra_pool  <- ra_draw$remaining
+  leftover <- ra_draw$leftover   # unmet demand after RA exhausted
+  
+  # 2. Draw remainder from CA
+  ca_draw  <- draw_bins(ca_pool, leftover)
+  ca_pool  <- ca_draw$remaining
+  
+  results[[i]] <- list(
+    RABinsTippedC   = ra_draw$tipped["C"],
+    RABinsTippedB   = ra_draw$tipped["B"],
+    RABinsTippedA   = ra_draw$tipped["A"],
+    RemainingRABinsC = ra_pool["C"],
+    RemainingRABinsB = ra_pool["B"],
+    RemainingRABinsA = ra_pool["A"],
+    CABinsTippedC   = ca_draw$tipped["C"],
+    CABinsTippedB   = ca_draw$tipped["B"],
+    CABinsTippedA   = ca_draw$tipped["A"],
+    RemainingCABinsC = ca_pool["C"],
+    RemainingCABinsB = ca_pool["B"],
+    RemainingCABinsA = ca_pool["A"]
+  )
+}
+
+# ── Bind results back into plan ────────────────────────────────────────────────
+res_df <- bind_rows(lapply(results, as.data.frame))
+
+# Strip any named-vector suffixes (e.g. "C.C" → "C") that bind_rows can produce
+names(res_df) <- sub("\\.[A-C]$", "", names(res_df))
+
+PackProgrammeToGo <- BinTipPlanRSP |>
+  dplyr::select(`ISO Week`, TotalBins) |>
+  bind_cols(res_df) |>
+  mutate(
+    RemainingRABins = RemainingRABinsC + RemainingRABinsB + RemainingRABinsA,
+    RABinsTipped    = RABinsTippedC    + RABinsTippedB    + RABinsTippedA
+  )
+
+#an_out, "BinTipPlan_calculated.csv")
+#print(plan_out)
+
+PackProgrammeToGo |>
+  dplyr::select(c(`ISO Week`,RemainingRABinsC,RemainingRABinsB,RemainingRABinsA,
+           RemainingCABinsC,RemainingCABinsB,RemainingCABinsA)) |>
+  pivot_longer(cols = -c(`ISO Week`),
+               names_to = "Remaining",
+               values_to = "Bins") |>
+  mutate(RSP = factor(str_sub(Remaining,-1,-1)),
+         `Storage type` = factor(str_sub(Remaining,10,11), levels = c("RA","CA"))) |>
+  ggplot(aes(x=`ISO Week`, y=Bins, colour=RSP)) +
+  geom_line(linewidth=1) +
+  facet_wrap(~`Storage type`) +
+  scale_fill_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  scale_colour_manual(values = c("#a9342c","#48762e","#526280","#f6c15f")) +
+  scale_y_continuous("Bins remaining", labels = scales::label_comma(1.0)) +
+  ggthemes::theme_economist() + 
+  theme(text = element_text(family = "Geograph"),
+        axis.title.x = element_text(margin = margin(t = 7), size = 10,colour = "#48762e",face = "bold"),
+        axis.title.y = element_text(margin = margin(r = 7), size = 10,colour = "#48762e",face = "bold"),
+        axis.text.y = element_text(size = 10, hjust=1,colour = "#48762e",face = "bold"),
+        axis.text.x = element_text(size = 10,colour = "#48762e",face = "bold"),
+        plot.background = element_rect(fill = "#F7F1DF", colour = "#F7F1DF"),
+        plot.title = element_text(margin = margin(b = 10)),
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 10))
+
+#write_csv(PackProgrammeToGo,"PackProgrammeToGo.csv")
+
+```
+```{r}
+#| label: data-incrementalOS
+
+con <- DBI::dbConnect(
+  odbc::odbc(),
+  Driver            = "SnowflakeDSIIDriver",   
+  Server            = Sys.getenv("SNOWFLAKE_SERVER"),
+  warehouse         = Sys.getenv("SNOWFLAKE_WHOUSE"),
+  UID               = Sys.getenv("SNOWFLAKE_UID"),
+  Authenticator     = "snowflake_jwt",
+  PRIV_KEY_FILE     = Sys.getenv("SNOWFLAKE_KEY_PATH"),
+  PRIV_KEY_FILE_PWD = Sys.getenv("SNOWFLAKE_KEY_PWD")
+)
+
+SeasonalSizeStats <- DBI::dbGetQuery(con,
+                                     "SELECT 
+    COUNT(MINOR) AS APPLES
+    ,AVG(MINOR) AS MEAN_EQ
+    ,STDDEV(MINOR) AS SD_EQ
+    ,AVG(MAJOR/MINOR) AS MEAN_ELONG
+    ,STDDEV(MAJOR/MINOR) AS SD_ELONG
+    ,AVG(WEIGHT) AS MEAN_MASS
+    ,STDDEV(WEIGHT) AS SD_MASS
+    ,COVAR_POP(MINOR,MAJOR/MINOR) AS COV
+FROM ROCKIT_DATA_PROD.COMPAC.STG_COMPAC_BATCH
+WHERE START_TIME > '2026-01-01 00:00:00.000' 
+AND START_TIME <= '2027-01-01 00:00:00.000' 
+AND NOT (SIZER_GRADE_NAME IN ('Capture','Rcy','Capture ','Recycle','Doub','Doubles ','Capt','Ai','Leaf','Cap'))
+AND MINOR >= 30
+AND MAJOR >= 30")
+
+MassByMeanEQ <- DBI::dbGetQuery(con,
+                                "WITH classified AS (
+    SELECT 
+        WEIGHT AS MASS,
+        MINOR,
+        CASE   
+            WHEN MINOR <= 52.5 THEN 'US'
+            WHEN MINOR <= 54.4 THEN '58'
+            WHEN MINOR <= 56.1 THEN '63 S'
+            WHEN MINOR <= 59.0 THEN '63 M'
+            WHEN MINOR <= 61.5 THEN '63 L'
+            WHEN MINOR <= 62.5 THEN '2PC'
+            WHEN MINOR <= 66.2 THEN '67'
+            WHEN MINOR <= 66.4 THEN '67(66.4)'
+            WHEN MINOR <= 66.6 THEN '67(66.6)'
+            WHEN MINOR <= 66.8 THEN '67(66.8)'
+            WHEN MINOR <= 71.8 THEN '72'
+            ELSE 'OS'
+        END AS EQ_IDX
+    FROM ROCKIT_DATA_PROD.COMPAC.STG_COMPAC_BATCH
+    WHERE START_TIME > '2026-01-01 00:00:00.000'
+    AND MINOR > 30
+    AND WEIGHT > 50
+)
+SELECT 
+    EQ_IDX,
+    AVG(MASS) AS MEAN_MASS,
+    COUNT(*) AS N
+FROM classified
+GROUP BY EQ_IDX
+ORDER BY MIN(MINOR)")
+
+DBI::dbDisconnect(con)
+
+EQCutsActual <- tibble(EQ_IDX = c("US","58","63 S","63 M","63 L","2PC","67","67(66.4)","67(66.6)","67(66.8)","72","OS"),
+                 EQLow = c(0,52.5,54.4,56.1,59.0,61.5,62.5,66.2,66.4,66.6,66.8,71.8),
+                 EQHigh = c(52.5,54.4,56.1,59.0,61.5,62.5,66.2,66.4,66.6,66.8,71.8,Inf)) |>
+  mutate(Prob = pnorm(EQHigh,SeasonalSizeStats$MEAN_EQ,SeasonalSizeStats$SD_EQ)-
+           pnorm(EQLow,SeasonalSizeStats$MEAN_EQ,SeasonalSizeStats$SD_EQ)) |>
+  left_join(MassByMeanEQ, by = "EQ_IDX") |>
+  mutate(WtMass = Prob*MEAN_MASS,
+         p_mass = WtMass/sum(WtMass))
+
+EQCutsToGo <- tibble(EQ_IDX = c("US","58","63 S","63 M","63 L","2PC","67","67(66.4)","67(66.6)","67(66.8)","72","OS"),
+                 EQLow = c(0,52.5,54.4,56.1,59.0,61.5,62.5,66.2,66.4,66.6,66.8,71.8),
+                 EQHigh = c(52.5,54.4,56.1,59.0,61.5,62.5,66.2,66.4,66.6,66.8,71.8,Inf)) |>
+  mutate(Prob = pnorm(EQHigh,63.00,SeasonalSizeStats$SD_EQ)-
+           pnorm(EQLow,63.00,SeasonalSizeStats$SD_EQ)) |>
+  left_join(MassByMeanEQ, by = "EQ_IDX") |>
+  mutate(WtMass = Prob*MEAN_MASS,
+         p_mass = WtMass/sum(WtMass))
+
+```
+
+
+
+## Seasonal packout prediction
+
+Using the model developed seperately and the packing plan detailed in @sec-PackingPlan, a seasonal packout prediction can be estimated.  
+
+## CA Uplift 
+
+CA packing has been generally constant over the packing period (the exception being in late season 2025 when storage days exceeded 230 days - refer to separate paper).  An uplift from the asymptotic values is observed and this is averaged over the last four years (excluding packouts from > 230 days in 2025). 
+
+In 2026 the effect of oversize fruit on Packout has been dramatic (currently 7.25%).  The season-to-date average equatorial diameter is `r round(SeasonalSizeStats$MEAN_EQ,1)`mm.  The projected fruit size for bins to be apcked is 63.0mm.  The 0.2mm difference in fruit size translates to a difference in oversize (by mass) of `r scales::percent(EQCutsToGo$p_mass[[12]]-EQCutsActual$p_mass[[12]],0.01)`
+
+The mean uplift (based on the last 3 years) is 5.2% which is discounted by 0.55% (to account for the increase in oversize).  The net uplift is thus calculated as 5.45%.  Moreover the influence of RSP on CA packout was found to be insignificant.  Thus, the components of the long term packing plan are:
+
+1. The batches already packed to date 
+2. The remaining RA batches which follow the model described separately, combined with the packing plan 
+3. The remainaing CA batches
+
+All three compenents are aggreggated to give the predicted end-of-season packout
+
+```{r}
+#| label: tbl-PackoutPrediction
+#| tbl-cap: "Packout prediction companents based on Bins packed, RA bins to pack and CA bins"
+
+sql <- glue::glue("
+  SELECT 
+      CASE
+          WHEN bd.StorageTypeID = 4 THEN 'CA'
+          ELSE 'RA'
+      END AS [Storage type]
+      ,SUM(bu.BinQty) AS BinQty 
+  FROM ma_Bin_UsageT AS bu
+  LEFT JOIN ma_Bin_DeliveryT AS bd
+      ON bd.BinDeliveryID = bu.BinDeliveryID
+  LEFT JOIN ma_Grader_BatchT AS gb
+      ON gb.GraderBatchID = bu.GraderBatchID
+  WHERE bd.SeasonID = 2013
+  AND bd.PresizeFlag = 0
+  AND (
+      bu.GraderBatchID IS NULL
+      OR gb.PackDate > '{cutoff_date}'
+  )
+  GROUP BY
+      CASE
+          WHEN bd.StorageTypeID = 4 THEN 'CA'
+          ELSE 'RA'
+      END
+")
+
+con <- DBI::dbConnect(odbc::odbc(),    
+                      Driver = "ODBC Driver 18 for SQL Server", 
+                      Server = "abcrepldb.database.windows.net",  
+                      Database = "ABCPackerRepl",   
+                      UID = "abcadmin",   
+                      PWD = "Trauts2018!",
+                      Port = 1433
+)
+
+BinsRemaining <- DBI::dbGetQuery(con, sql)
+
+DBI::dbDisconnect(con)
+
+################################################################################
+# Calculate the mean harvest date for for average storage day calculation      #
+################################################################################
+
+WAHD <- BDV2024 |>
+  filter(Season == 2026,
+         Presize == "Field bin") |>
+  summarise(WAHD = weighted.mean(HarvestDate, `Bins received`))
+
+################################################################################
+# Calculate the Weight mean mass per bin                                       #
+################################################################################
+
+WAMPB <- PackOutPlotSum |>
+  filter(Season == "2026") |>
+  summarise(InputKgs = sum(InputKgs),
+            FieldBinsTipped = sum(FieldBinsTipped)) |>
+  mutate(WAMPB = InputKgs/FieldBinsTipped)
+
+################################################################################
+# Function to return a data frame that gives the start and finish or RA and CA #
+# packing                                                                      #
+################################################################################
+
+StorageDayEstimates <- function(PackProgrammeToGo, WAHarvestDate) {
+  
+  FuturePackDataRA <- PackProgrammeToGo |>
+    mutate(RABinsTipped = RABinsTippedA+RABinsTippedB+RABinsTippedC) |>
+    filter(RABinsTipped > 0) |>
+    mutate(weekdate = str_c("2026-W",`ISO Week`,"-3"),
+           PackDate = ISOweek::ISOweek2date(weekdate),
+           StorageDays = as.integer(PackDate-WAHD$WAHD[[1]]))
+  
+  FuturePackDataCA <- PackProgrammeToGo |>
+    mutate(CABinsTipped = CABinsTippedA+CABinsTippedB+CABinsTippedC) |>
+    filter(CABinsTipped > 0) |>
+    mutate(weekdate = str_c("2026-W",`ISO Week`,"-3"),
+           PackDate = ISOweek::ISOweek2date(weekdate),
+           StorageDays = as.integer(PackDate-WAHD$WAHD[[1]]))
+  
+  ##  Account for when RA packing has ended
+  if(nrow(FuturePackDataRA) == 0) {
+    FuturePackDataRA[1:2,] <- NA
+    FuturePackDataRA[[1,12]] <- 1
+    FuturePackDataRA[[2,12]] <- as.integer(ISOweek::ISOweek2date("2025-W35-3")-WAHarvestDate[[2,2]])
+  } else if (nrow(FuturePackDataCA) == 0) {
+    FuturePackDataCA[1:2,] <- NA
+  }
+  
+  StorageDayCuts <- tibble(`Storage type` = c("RA","CA"),
+                           StorageDays_Start = c(FuturePackDataRA$StorageDays[[1]],
+                                                 FuturePackDataCA$StorageDays[[1]]),
+                           StorageDays_End = c(FuturePackDataRA$StorageDays[[nrow(FuturePackDataRA)]],
+                                               FuturePackDataCA$StorageDays[[nrow(FuturePackDataCA)]])) |>
+    ungroup()
+  
+  return(StorageDayCuts)
+  
+}
+
+#
+# Run the function to get the range of storage days for each storage type
+#
+
+SDEstimates <- StorageDayEstimates(PackProgrammeToGo,WAHD)
+
+################################################################################
+# Function to return the ISO week when CA finishes packing                     #
+################################################################################
+
+WeekCABeginsEnds <- function(PackProgrammeToGo) {
+  
+  FuturePackDataCA <- PackProgrammeToGo |>
+    mutate(CABinsTipped = CABinsTippedA+CABinsTippedB+CABinsTippedC) |>
+    filter(CABinsTipped > 0) 
+  
+  WeekCABegins <- tibble(`CA start week` = FuturePackDataCA$`ISO Week`[[1]],
+                         `CA finish week` = FuturePackDataCA$`ISO Week`[[nrow(FuturePackDataCA)]])
+  
+  return(WeekCABegins)
+  
+}
+
+CB <- WeekCABeginsEnds(PackProgrammeToGo)
+
+###################################################################################
+#  Estimate the CA uplift                                                         #
+###################################################################################
+
+GBVCA2425 <- PackOutPlotSumRaw |>
+  filter(Presize == "Field bin",
+         BatchStatus == "Closed",
+         `Storage type` == "CA Smartfresh",
+         Season %in% c("2024","2025")) |>
+  mutate(StorageDays = as.numeric(PackDate-HarvestDate)) |>
+  filter(StorageDays > 150)
+
+RepCASD <- GBVCA2425 |>
+  group_by(Season) |>
+  summarise(MaxSD = max(StorageDays),
+            MinSD = min(StorageDays)) |>
+  mutate(RepSD = (MaxSD+MinSD)/2)
+
+meanCAPO <- GBVCA2425 |>
+  group_by(Season) |>
+  summarise(Packout1 = weighted.mean(Packout1, InputKgs))
+
+#
+# Generate RA data to do the non-linear model for 2024 and 2025
+#
+PackOutPlotSum2425 <- PackOutPlotSumRaw |>
+  mutate(YearDays = yday(PackDate)) |>
+  filter(Presize == "Field bin",
+         BatchStatus == "Closed",
+         `Storage type` != "CA Smartfresh",
+         Season %in% c("2024","2025")) |>
+  mutate(StorageDays = as.integer(PackDate - HarvestDate)) 
+#
+# Calculate the representative baseline packout values for 2025 and 2024
+#
+RepCASD <- GBVCA2425 |>
+  group_by(Season) |>
+  summarise(MaxSD = max(StorageDays),
+            MinSD = min(StorageDays)) |>
+  mutate(RepSD = (MaxSD+MinSD)/2)
+#
+# Run model for 2024 RA data
+#
+NLmodel2024RA <- nls(Packout1 ~ alpha *exp(beta * StorageDays) + theta, 
+                     data=PackOutPlotSum2425 |> filter(Season == "2024"), 
+                     control = nls.control(maxiter = 1000), 
+                     start=list(alpha=0.1, beta=-.1, theta=0.60))
+#
+# Calculate the baseline using the mid point of the storage day window for CA
+#
+Baseline2024 <- predict(NLmodel2024RA, newdata = tibble(StorageDays = RepCASD$RepSD[[1]]))
+#
+# Run the model for the 2025 data
+#
+NLmodel2025RA <- nls(Packout1 ~ alpha *exp(beta * StorageDays) + theta, 
+                     data=PackOutPlotSum2425 |> filter(Season == "2025"), 
+                     control = nls.control(maxiter = 1000,minFactor = 1/4096), 
+                     start=list(alpha=0.15, beta=-.01, theta=0.65))
+#
+# Calculate the baseline using the mid point of the storage day window for CA
+#
+Baseline2025 <- predict(NLmodel2025RA, newdata = tibble(StorageDays = RepCASD$RepSD[[2]]))
+#
+# Calculate the CA uplift using the mean of the 2024 and 2025 uplift
+#
+CAUplift <- tibble(Season = c("2024","2025"),
+                   RepRABL = c(Baseline2024,Baseline2025)) |>
+  inner_join(meanCAPO, by = "Season") |>
+  mutate(Uplift = Packout1-RepRABL)
+
+MeanUplift <- ((CAUplift$Uplift[[1]]+CAUplift$Uplift[[2]])/2)-
+  (EQCutsToGo$p_mass[[12]]-EQCutsActual$p_mass[[12]])
+#
+# Crate a data frame of model CA packout data vs Storage days (i.e. constant)
+#
+PackOutPlotSum2026 <- PackOutPlotSumRaw |>
+  filter(Season == "2026",
+         `Storage type` %in% c("Normal Air","Smartfreshed"))
+
+StorageDaysRA <- tibble(StorageDays = seq(0,max(PackOutPlotSum$StorageDays),1))
+
+NLmodel2026RA <- nls(Packout1 ~ alpha *exp(beta * StorageDays) + theta, 
+                      data=PackOutPlotSum2026, 
+                      control = nls.control(maxiter = 1000), 
+                      start=list(alpha=0.1, beta=-.1, theta=0.60))
+
+PackoutEndRA <- predict(NLmodel2026RA,newdata = tibble(StorageDays = SDEstimates$StorageDays_End[[1]]))
+
+modelCAPO2026 <- tibble(StorageDays = seq(SDEstimates$StorageDays_Start[[2]],SDEstimates$StorageDays_End[[2]],1)) |>
+  mutate(Packout1 = PackoutEndRA+MeanUplift,
+         Season = 2026,
+         `Storage type` = "CA")
+
+###############################################################################
+#   
+
+BinsTippedFinalSummaryTotal <- PackOutPlotSumRaw |>
+  filter(Season == "2026") |>
+  mutate(`Storage type` = if_else(`Storage type` == "CA Smartfresh","CA","RA")) |>
+  summarise(FieldBinsTipped = sum(FieldBinsTipped),
+            Reject = sum(RejectKgs),
+            `Class 1.5` = sum(`Class 1.5`),
+            `Class 2` = sum(`Class 2`),
+            `Library samples` = sum(LibSampKGs),
+            `Class 1` = sum(`Class 1 kgs`),
+            Input = sum(InputKgs))
+
+BinsTippedTable <- BinsTippedFinalSummaryTotal |>
+  mutate(`Already packed_Input_tonnes` = Input/1000,
+         `Already packed_Reject_tonnes` = Reject/1000,
+         `Already packed_Class15_tonnes` = `Class 1.5`/1000,
+         `Already packed_Class2_tonnes` = `Class 2`/1000,
+         `Already packed_Library_sample_tonnes` = `Library samples`/1000,
+         `Already packed_Class 1_tonnes` = `Class 1`/1000,
+         `Already packed_Packout_%` =  `Already packed_Class 1_tonnes`/`Already packed_Input_tonnes`) |>
+  select(c(`Already packed_Input_tonnes`,`Already packed_Class 1_tonnes`,`Already packed_Packout_%`))
+
+FuturePackSummary <- function(PackProgrammeToGo,WAHarvestDate,WAMassPerBin,NLmodel_RSP_theta) {
+  
+  FuturePackDataRA <- PackProgrammeToGo |>
+    mutate(RABinsTipped = RABinsTippedC+RABinsTippedB+RABinsTippedA) |>
+    filter(RABinsTipped > 0) |>
+    mutate(weekdate = str_c("2026-W",`ISO Week`,"-3"),
+           PackDate = ISOweek::ISOweek2date(weekdate),
+           StorageDays = as.integer(PackDate-WAHD$WAHD[[1]]),
+           InputKgsC = RABinsTippedC*WAMPB$WAMPB[[1]],
+           InputKgsB = RABinsTippedB*WAMPB$WAMPB[[1]],
+           InputKgsA = RABinsTippedA*WAMPB$WAMPB[[1]])
+  
+  SDPO <- FuturePackDataRA |>
+    pull(StorageDays)
+  
+  newdata <- expand_grid(StorageDays = SDPO, RSP=c("A","B","C")) |>
+    mutate(RSP = factor(RSP, levels = c("A", "B", "C")))
+  
+  Packout <- tibble(Packout1 = predict(NLmodel_RSP_theta, newdata = newdata)) |>
+    bind_cols(newdata) |>
+    pivot_wider(id_cols = StorageDays,
+                names_from = RSP,
+                values_from = Packout1) 
+  
+  FinalFuturePackDatesRA <- FuturePackDataRA |>
+    left_join(Packout, by = "StorageDays") |>
+    mutate(InputKgs = InputKgsA + InputKgsB + InputKgsC,
+           ExportKgs = C*InputKgsC + B*InputKgsB + A*InputKgsA) |>
+    dplyr::select(c(PackDate,StorageDays,RABinsTippedC,RABinsTippedB,RABinsTippedA,
+                    InputKgs,ExportKgs)) 
+  
+  return(FinalFuturePackDatesRA)
+  
+}
+
+FPSRA <- FuturePackSummary(PackProgrammeToGo,WAHD,WAMPB,NLmodel_RSP_theta)
+
+CABinsToGoRaw <- BinsRemaining[2,] |>
+  mutate(`CA to go_Input_tonnes` = BinQty*WAMPB$WAMPB[[1]]/1000) |>
+  dplyr::select(`CA to go_Input_tonnes`)
+
+POCalculation <- BinsTippedTable |>
+  bind_cols(FPSRA |>
+              ungroup() |>
+              summarise(`RA to go_Input_tonnes` = sum(InputKgs)/1000,
+                        `RA to go_Class 1_tonnes` = sum(ExportKgs)/1000) |>
+              mutate(`RA to go_Packout_%` = `RA to go_Class 1_tonnes`/`RA to go_Input_tonnes`)) |>
+  bind_cols(CABinsToGoRaw |>
+              mutate(`CA to go_Packout_%` = PackoutEndRA+MeanUplift,
+                     `CA to go_Class 1_tonnes` = `CA to go_Packout_%`*`CA to go_Input_tonnes`) |>
+              dplyr::select(`CA to go_Input_tonnes`,`CA to go_Class 1_tonnes`,`CA to go_Packout_%`))
+
+POCalculation |>
+  mutate(across(.cols = c(`Already packed_Input_tonnes`,`Already packed_Class 1_tonnes`,`RA to go_Input_tonnes`,
+                          `RA to go_Class 1_tonnes`,`CA to go_Input_tonnes`,`CA to go_Class 1_tonnes`),
+                ~scales::comma(.,0.1)),
+         across(.cols = c(`Already packed_Packout_%`,`RA to go_Packout_%`,`CA to go_Packout_%`),
+                ~scales::percent(.,0.1))) |>
+  flextable::flextable() |>
+  flextable::separate_header() |>
+  flextable::align(j=c(1:9), align = "right", part = "body") |>
+  flextable::align(j=c(1:9), align = "center", part = "header") |>
+  flextable::bold(bold = T, part = "header") |>
+  flextable::bold(j=c(3,6,9), bold = T, part = "body") |>
+  flextable::autofit() |>
+  flextable::fit_to_width(max_width=6)
+```
+
+```{r}
+#| label: tbl-SeasonPAckout
+#| tbl-cap:  "Seasonal Packout prediction based on the model discussed above"
+
+POCalculation |>
+  mutate(Seasonal_Input_tonnes = `Already packed_Input_tonnes`+`RA to go_Input_tonnes`+`CA to go_Input_tonnes`,
+         `Seasonal_Class 1_tonnes` = `Already packed_Class 1_tonnes`+`RA to go_Class 1_tonnes`+`CA to go_Class 1_tonnes`,
+         `Seasonal_Packout_%` = `Seasonal_Class 1_tonnes`/Seasonal_Input_tonnes,
+         across(.cols = c(Seasonal_Input_tonnes,`Seasonal_Class 1_tonnes`), ~scales::comma(.,0.1)),
+         `Seasonal_Packout_%` = scales::percent(`Seasonal_Packout_%`,0.1)) |>
+  dplyr::select(c(Seasonal_Input_tonnes,`Seasonal_Class 1_tonnes`,`Seasonal_Packout_%`)) |>
+  flextable::flextable() |>
+  flextable::separate_header() |>
+  flextable::align(j=c(1:3), align="right", part = "body") |>
+  flextable::align(j=c(1:3), align = "center", part = "header") |>
+  flextable::bold(bold = T, part = "header") |>
+  flextable::bold(bold=T, j=3, part="body") |>
+  flextable::autofit() 
+
+
+```
